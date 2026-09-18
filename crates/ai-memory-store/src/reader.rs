@@ -2825,6 +2825,30 @@ impl ReaderPool {
         .await
     }
 
+    /// Read one committed hook observation by its immutable receipt, never by
+    /// "latest". The admitted source tuple is required even on keyed replays.
+    ///
+    /// # Errors
+    /// Propagates SQL/pool errors. Legacy or pruned receipts return `None`.
+    pub async fn hook_observation_receipt(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        observation_id: Option<ai_memory_core::ObservationId>,
+        ingest_key: Option<String>,
+    ) -> StoreResult<Option<Observation>> {
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, importance, created_at \
+                 FROM observations WHERE workspace_id=?1 AND project_id=?2 AND session_id=?3 \
+                 AND id=COALESCE(?4, (SELECT observation_id FROM ingest_keys WHERE project_id=?2 AND key=?5))",
+                params![workspace_id.as_bytes(), project_id.as_bytes(), session_id.as_bytes(), observation_id.map(|id| id.as_bytes().to_vec()), ingest_key],
+                row_to_observation,
+            ).optional()?.transpose()
+        }).await
+    }
+
     /// Return all observations for the given session, ordered by
     /// `created_at` ascending.
     ///

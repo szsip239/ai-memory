@@ -97,6 +97,9 @@ pub enum AdmissionOp {
     MessagePop,
     /// Pending cross-project messages are being cancelled by their sender.
     MessageCancel,
+    /// A sanitized Stop observation has committed. A blocking reject subscriber
+    /// gates receipt completion, not capture: native spool replay retries it.
+    StopCaptured,
 }
 
 impl AdmissionOp {
@@ -118,6 +121,7 @@ impl AdmissionOp {
             AdmissionOp::MessageSend => "message_send",
             AdmissionOp::MessagePop => "message_pop",
             AdmissionOp::MessageCancel => "message_cancel",
+            AdmissionOp::StopCaptured => "stop_captured",
         }
     }
 }
@@ -182,6 +186,9 @@ pub struct WebhookConfig {
 /// (mostly references at the request layer, owned here for serialisation).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AdmissionContext {
+    /// Optional exact committed Stop result. Never carries a raw transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_result: Option<CapturedStop>,
     /// Workspace name the write belongs to. Resolved automatically by
     /// [`crate::Wiki::write_page`] from `workspace_id` when the wiki has
     /// been built with [`crate::Wiki::with_store_reader`]; left empty
@@ -222,6 +229,21 @@ pub struct AdmissionContext {
     /// matched against [`WebhookConfig::name`] to short-circuit re-entrant writes.
     #[serde(default, skip_serializing)]
     pub skip_webhooks: Vec<String>,
+}
+
+/// Bounded captured result for event-driven consumers; text remains untrusted.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapturedStop {
+    /// Stable persisted observation identity, used by receivers for deduplication.
+    pub observation_id: String,
+    /// Server-admitted source session identity.
+    pub session_id: String,
+    /// Persisted timestamp, not the time a replay happens to arrive.
+    pub created_us: i64,
+    /// Existing sanitized capture excerpt (not a guarantee of a full reply).
+    pub body: String,
+    /// Optional client correlation metadata; not an authorization grant.
+    pub subscription_revision: Option<u64>,
 }
 
 /// Wire format sent to each webhook (one POST per webhook per write).
@@ -325,6 +347,11 @@ impl AdmissionChain {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.webhooks.is_empty()
+    }
+
+    /// Whether a caller needs to build metadata for this event at all.
+    pub fn subscribes(&self, op: AdmissionOp) -> bool {
+        self.webhooks.iter().any(|hook| hook.events.contains(&op))
     }
 
     /// Run the chain against `markdown` (mutating `frontmatter`/`body` in

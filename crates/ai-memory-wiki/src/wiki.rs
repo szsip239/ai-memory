@@ -1312,6 +1312,45 @@ impl Wiki {
         }
     }
 
+    /// True only when an operator opted into committed Stop notifications.
+    pub fn observes_captured_stops(&self) -> bool {
+        self.admission_chain
+            .as_ref()
+            .is_some_and(|chain| chain.subscribes(AdmissionOp::StopCaptured))
+    }
+
+    /// Deliver a committed capture using the existing webhook chain. Reliable
+    /// local receivers use blocking+reject to acknowledge durable receipt; on
+    /// failure the native hook spool retains this event. Capture stays committed.
+    ///
+    /// # Errors
+    /// A deciding receiver failed to acknowledge. Do not complete the ingest key.
+    pub async fn notify_captured_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+        result: crate::CapturedStop,
+    ) -> WikiResult<()> {
+        let Some(chain) = &self.admission_chain else {
+            return Ok(());
+        };
+        let mut ctx = self
+            .operation_admission_ctx(
+                workspace_id,
+                project_id,
+                AdmissionOp::StopCaptured,
+                actor,
+                skip_webhooks,
+            )
+            .await;
+        ctx.stop_result = Some(result);
+        chain.authorize(None, &ctx).await?;
+        chain.dispatch_notify_observers(None, &ctx);
+        Ok(())
+    }
+
     async fn operation_admission_ctx(
         &self,
         workspace_id: WorkspaceId,

@@ -17,8 +17,8 @@ mod watcher;
 mod wiki;
 
 pub use admission::{
-    AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
-    MAX_RESPONSE_BYTES, WebhookConfig,
+    AdmissionChain, AdmissionContext, AdmissionOp, CapturedStop, FailurePolicy,
+    MAX_ADMISSION_WEBHOOKS, MAX_RESPONSE_BYTES, WebhookConfig,
 };
 pub use atomic::write_atomic;
 pub use error::{WikiError, WikiResult};

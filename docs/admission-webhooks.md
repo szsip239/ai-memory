@@ -38,6 +38,11 @@ hook that mirrors the enriched page.
 
 Webhooks fire on these `op` values today (extensible enum):
 
+- `stop_captured` — local opt-in development interface for exact committed
+  Stop receipts; see [receipt semantics and limitations](stop-result-receipts.md).
+  Its acknowledged mode runs in native batched ingest after capture, unlike
+  pre-mutation admission. It never rolls back a captured result.
+
 - `write_page` — direct writes via MCP `memory_write_page`, the CLI
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
 - `consolidate` — LLM consolidation writes from the consolidator

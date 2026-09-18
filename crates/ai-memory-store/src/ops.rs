@@ -2391,6 +2391,10 @@ pub fn insert_observation_keyed(
         params![obs.project_id.as_bytes(), ingest_key, now],
     )?;
     let id = insert_observation_row(&tx, obs)?;
+    tx.execute(
+        "UPDATE ingest_keys SET observation_id = ?3 WHERE project_id = ?1 AND key = ?2",
+        params![obs.project_id.as_bytes(), ingest_key, id.as_bytes()],
+    )?;
     tx.commit()?;
     Ok(IngestObservationOutcome::Inserted(id))
 }
@@ -2564,7 +2568,12 @@ pub fn admit_hook_session_event(
             }
             None => {
                 tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
-                IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
+                let id = insert_observation_row(&tx, obs)?;
+                tx.execute(
+                    "UPDATE ingest_keys SET observation_id = ?3 WHERE project_id = ?1 AND key = ?2",
+                    params![obs.project_id.as_bytes(), key, id.as_bytes()],
+                )?;
+                IngestObservationOutcome::Inserted(id)
             }
         }
     } else {

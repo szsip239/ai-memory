@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Retained the local opt-in, durable `stop_captured` receipt and native spool
+  replay after commit; source-scoped receipts never use a latest-result lookup.
+
+### Changed
+- Kept the deployed local migration lineage (V65 receipt, V67 compaction,
+  V68 claim attempts); mapped new upstream V67–V70 to local V69–V72.
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

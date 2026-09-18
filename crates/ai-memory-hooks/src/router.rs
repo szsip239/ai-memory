@@ -80,6 +80,22 @@ const AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT: std::time::Duration =
 /// (mid-turn) away from their last event.
 const LIVE_BATON_QUIET_PERIOD: jiff::SignedDuration = jiff::SignedDuration::from_mins(10);
 
+#[derive(Debug)]
+struct StopDeliveryPending;
+impl std::fmt::Display for StopDeliveryPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("committed Stop awaits durable receiver acknowledgment")
+    }
+}
+impl std::error::Error for StopDeliveryPending {}
+
+fn result_delivery_revision(env: &HookEnvelope) -> Option<u64> {
+    env.raw
+        .get("coordination_subscription_revision")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+}
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -638,6 +654,15 @@ async fn handle_hook(
     // on for a supported Stop, populate the Stop body with the sanitized excerpt.
     // Any gate failure leaves an empty Stop with the same 202 "queued" response.
     crate::assistant_capture::apply_assistant_backstop(&mut env, state.capture_assistant_enabled);
+    if env.event == HookEvent::Stop
+        && result_delivery_revision(&env).is_some()
+        && state.wiki.observes_captured_stops()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "result delivery requires native /hook/batch receipts",
+        );
+    }
     let Some(env) = inspect_capture_envelope(env) else {
         state.ingest_metrics.record_dropped_by_policy();
         return (StatusCode::ACCEPTED, "capture policy dropped");
@@ -903,6 +928,14 @@ async fn handle_hook_batch(
                 state.ingest_metrics.record_dropped_unauthorized();
                 warn!("hook batch capture dropped: author may not write this project");
                 accepted_indices.push(idx);
+                continue;
+            }
+            if e.is::<StopDeliveryPending>() {
+                // The observation already committed. Leave only this item
+                // unacknowledged, like a rate-limited item, without charging
+                // the spool retry budget or starving unrelated captures.
+                state.ingest_metrics.record_persisted(now_unix_ms());
+                warn!("Stop receiver unavailable; retained native spool receipt");
                 continue;
             }
             if matches!(
@@ -3106,6 +3139,44 @@ async fn process_authorized(
     }
     ws = admitted.workspace_id();
     proj = admitted.project_id();
+    if env.event == HookEvent::Stop
+        && result_delivery_revision(&env).is_some()
+        && state.wiki.observes_captured_stops()
+    {
+        let inserted_id = match ingest {
+            IngestObservationOutcome::Inserted(id) => Some(id),
+            _ => None,
+        };
+        let observation = state
+            .reader
+            .hook_observation_receipt(ws, proj, session_id, inserted_id, ingest_key.clone())
+            .await?;
+        let observation = observation.ok_or_else(|| {
+            anyhow::anyhow!("Stop receipt unavailable; refusing to substitute latest observation")
+        })?;
+        if !observation.body.is_empty() {
+            state
+                .wiki
+                .notify_captured_stop(
+                    ws,
+                    proj,
+                    parse_session_owner(admitted.owner().map(str::to_owned))?
+                        .as_ref()
+                        .map(IdentityKey::to_actor_context)
+                        .unwrap_or_default(),
+                    skip_webhooks.clone(),
+                    ai_memory_wiki::CapturedStop {
+                        observation_id: observation.id.to_string(),
+                        session_id: session_id.to_string(),
+                        created_us: observation.created_at.as_microsecond(),
+                        body: observation.body,
+                        subscription_revision: result_delivery_revision(&env),
+                    },
+                )
+                .await
+                .map_err(|_| StopDeliveryPending)?;
+        }
+    }
     if let Some(run_id) = managed_run
         && let Some(native_session_id) = env
             .session_id
@@ -10724,6 +10795,124 @@ mod tests {
         let mut state = make_state(tmp).await;
         state.wiki = state.wiki.clone().with_admission_chain(chain);
         state
+    }
+
+    #[tokio::test]
+    async fn stop_receipt_replay_uses_the_exact_committed_result() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let app = Router::new().route(
+            "/result",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let seen = seen.clone();
+                let tx = tx.clone();
+                async move {
+                    tx.send(body).await.unwrap();
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/result", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = TempDir::new().unwrap();
+        let state = make_state_with_admission(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+                name: "result-receiver".into(),
+                url,
+                events: vec![AdmissionOp::StopCaptured],
+                blocking: true,
+                failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+                timeout_ms: 1000,
+            }])
+            .unwrap(),
+        )
+        .await;
+        let session = SessionId::new();
+        let mut env = session_envelope("stop", &session.to_string(), &tmp.path().to_string_lossy());
+        env.body_excerpt = Some("first committed result".into());
+        env.ingest_key = Some("stable-stop".into());
+        env.raw["coordination_subscription_revision"] = serde_json::json!(1);
+        let error = process(&state, env.clone(), None, vec![])
+            .await
+            .unwrap_err();
+        assert!(error.is::<StopDeliveryPending>());
+        let first = rx.recv().await.unwrap();
+        let rows = state
+            .reader
+            .observations_for_session(session)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "capture survives receiver failure");
+        assert_eq!(
+            first["ctx"]["stop_result"]["observation_id"],
+            rows[0].id.to_string()
+        );
+        assert_eq!(first["ctx"]["stop_result"]["body"], rows[0].body);
+        env.body_excerpt = Some("different replay payload must not replace stored result".into());
+        process(&state, env.clone(), None, vec![]).await.unwrap();
+        let replay = rx.recv().await.unwrap();
+        assert_eq!(replay["ctx"]["stop_result"], first["ctx"]["stop_result"]);
+        process(&state, env, None, vec![]).await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "completed replay must not notify again"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let wrong_scope = state
+            .reader
+            .hook_observation_receipt(
+                WorkspaceId::new(),
+                rows[0].project_id,
+                session,
+                Some(rows[0].id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(wrong_scope.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_receipt_requires_selection_and_nonempty_stop_body() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state_with_admission(
+            &tmp,
+            refusing_admission_chain("unavailable", vec![AdmissionOp::StopCaptured]),
+        )
+        .await;
+        for (event, revision, body) in [
+            ("stop", 0, "not selected"),
+            ("stop", 1, ""),
+            ("user-prompt", 1, "not a result"),
+        ] {
+            let mut env = session_envelope(
+                event,
+                &SessionId::new().to_string(),
+                &tmp.path().to_string_lossy(),
+            );
+            env.body_excerpt = Some(body.into());
+            env.raw["coordination_subscription_revision"] = serde_json::json!(revision);
+            process(&state, env, None, vec![])
+                .await
+                .expect("must not call unavailable result receiver");
+        }
     }
 
     #[tokio::test]
