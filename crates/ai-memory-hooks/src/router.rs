@@ -96,6 +96,47 @@ fn result_delivery_revision(env: &HookEnvelope) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
+/// The local shared Hook wrapper extracts references before native excerpt
+/// truncation. They remain untrusted data, opt-in and bounded independently of
+/// the stored observation body. Native spool retries preserve this envelope;
+/// downstream durable acceptance prevents a replay from replacing accepted refs.
+fn result_artifact_refs(env: &HookEnvelope, sanitizer: &ai_memory_core::Sanitizer) -> Vec<String> {
+    if result_delivery_revision(env).is_none() {
+        return Vec::new();
+    }
+    let Some(values) = env
+        .raw
+        .get("coordination_reply_refs")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    if values.len() > 64 {
+        return Vec::new();
+    }
+    let mut total = 0;
+    let mut refs = Vec::new();
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Vec::new();
+        };
+        total += value.len();
+        if value.is_empty()
+            || value.len() > 2048
+            || total > 12000
+            || value.chars().any(char::is_control)
+        {
+            return Vec::new();
+        }
+        let scrubbed = sanitizer.scrub(value);
+        // A redaction would break the target; do not forward a modified URL/path.
+        if scrubbed == value && !refs.contains(&scrubbed) {
+            refs.push(scrubbed);
+        }
+    }
+    refs
+}
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -3171,6 +3212,8 @@ async fn process_authorized(
                         created_us: observation.created_at.as_microsecond(),
                         body: observation.body,
                         subscription_revision: result_delivery_revision(&env),
+                        artifact_refs: result_artifact_refs(&env, &state.sanitizer),
+                        artifact_cwd: env.cwd.clone(),
                     },
                 )
                 .await

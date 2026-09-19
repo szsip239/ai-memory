@@ -244,6 +244,10 @@ pub struct CapturedStop {
     pub body: String,
     /// Optional client correlation metadata; not an authorization grant.
     pub subscription_revision: Option<u64>,
+    /// Bounded references from the same native spool event, never full reply text.
+    pub artifact_refs: Vec<String>,
+    /// Native hook working directory; receivers must enforce their own root policy.
+    pub artifact_cwd: Option<String>,
 }
 
 /// Wire format sent to each webhook (one POST per webhook per write).
