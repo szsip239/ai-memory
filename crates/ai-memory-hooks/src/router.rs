@@ -96,6 +96,16 @@ fn result_delivery_revision(env: &HookEnvelope) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
+fn result_pane_key(env: &HookEnvelope) -> Option<String> {
+    result_delivery_revision(env)?;
+    env.raw
+        .get("coordination_pane_key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .filter(|value| !value.chars().any(char::is_control))
+        .map(str::to_owned)
+}
+
 /// The local shared Hook wrapper extracts references before native excerpt
 /// truncation. They remain untrusted data, opt-in and bounded independently of
 /// the stored observation body. Native spool retries preserve this envelope;
@@ -3214,6 +3224,8 @@ async fn process_authorized(
                         subscription_revision: result_delivery_revision(&env),
                         artifact_refs: result_artifact_refs(&env, &state.sanitizer),
                         artifact_cwd: env.cwd.clone(),
+                        agent_provider: env.agent.as_str().to_owned(),
+                        pane_key: result_pane_key(&env),
                     },
                 )
                 .await

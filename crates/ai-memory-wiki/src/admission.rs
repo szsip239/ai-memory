@@ -248,6 +248,10 @@ pub struct CapturedStop {
     pub artifact_refs: Vec<String>,
     /// Native hook working directory; receivers must enforce their own root policy.
     pub artifact_cwd: Option<String>,
+    /// Closed provider identity admitted by the native Hook server.
+    pub agent_provider: String,
+    /// Orca pane capability supplied by the reviewed local wrapper, when present.
+    pub pane_key: Option<String>,
 }
 
 /// Wire format sent to each webhook (one POST per webhook per write).
