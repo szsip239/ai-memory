@@ -106,6 +106,23 @@ fn result_pane_key(env: &HookEnvelope) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn result_reply_text(env: &HookEnvelope, sanitizer: &ai_memory_core::Sanitizer) -> Option<String> {
+    result_delivery_revision(env)?;
+    let value = env
+        .raw
+        .get("coordination_reply_text")
+        .and_then(serde_json::Value::as_str)?;
+    if value.is_empty() || value.len() > 64 * 1024 {
+        return None;
+    }
+    let scrubbed = sanitizer.scrub(value);
+    let mut end = scrubbed.len().min(8_000);
+    while !scrubbed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(scrubbed[..end].to_owned())
+}
+
 /// The local shared Hook wrapper extracts references before native excerpt
 /// truncation. They remain untrusted data, opt-in and bounded independently of
 /// the stored observation body. Native spool retries preserve this envelope;
@@ -3220,6 +3237,8 @@ async fn process_authorized(
                         observation_id: observation.id.to_string(),
                         session_id: session_id.to_string(),
                         created_us: observation.created_at.as_microsecond(),
+                        reply: result_reply_text(&env, &state.sanitizer)
+                            .unwrap_or_else(|| observation.body.clone()),
                         body: observation.body,
                         subscription_revision: result_delivery_revision(&env),
                         artifact_refs: result_artifact_refs(&env, &state.sanitizer),

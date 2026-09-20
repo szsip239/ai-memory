@@ -242,6 +242,8 @@ pub struct CapturedStop {
     pub created_us: i64,
     /// Existing sanitized capture excerpt (not a guarantee of a full reply).
     pub body: String,
+    /// Sanitized, independently capped text for the user-facing conversation card.
+    pub reply: String,
     /// Optional client correlation metadata; not an authorization grant.
     pub subscription_revision: Option<u64>,
     /// Bounded references from the same native spool event, never full reply text.
