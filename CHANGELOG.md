@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Retained local Kimi Stop capture through the existing wrapper-injected
+  assistant excerpt, without removing upstream OpenCode capture support (#826).
 - Retained the local opt-in, durable `stop_captured` receipt and native spool
   replay after commit; source-scoped receipts never use a latest-result lookup.
 
