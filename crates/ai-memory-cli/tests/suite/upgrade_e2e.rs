@@ -175,7 +175,7 @@ mod slow {
     }
 
     #[tokio::test]
-    async fn native_upgrade_replaces_binary_and_sibling_hooks_from_fixture() {
+    async fn native_upgrade_refuses_stock_replacement_for_local_lineage() {
         let asset = host_asset_name().to_string();
         let archive = Arc::new(build_release_archive());
         let hash = format!("{:x}", Sha256::digest(archive.as_ref()));
@@ -222,28 +222,28 @@ mod slow {
             .expect("spawn upgrade");
 
         assert!(
-            output.status.success(),
-            "upgrade failed: stdout={}\nstderr={}",
+            !output.status.success(),
+            "patched upgrade must refuse stock replacement: stdout={}\nstderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.contains(&format!("upgraded to {TAG}")),
-            "missing success line: {stdout}"
+            stderr.contains("locally patched build"),
+            "missing compatibility refusal: {stderr}"
         );
 
         let after = fs::read(&exe).expect("read post-upgrade binary");
-        assert_eq!(after, NEW_BINARY, "on-disk binary was not replaced");
+        assert_eq!(after, before, "on-disk patched binary must stay intact");
 
         let hooks_root = prefix.path().join("bin/hooks");
         assert_eq!(
-            fs::read(hooks_root.join("claude-code/new.sh")).expect("new hook"),
-            NEW_HOOK
+            fs::read(hooks_root.join("claude-code/old.sh")).expect("old hook"),
+            OLD_HOOK
         );
         assert!(
-            !hooks_root.join("claude-code/old.sh").exists(),
-            "sibling hooks tree should be fully replaced"
+            !hooks_root.join("claude-code/new.sh").exists(),
+            "sibling hooks tree must not be replaced"
         );
 
         server.abort();

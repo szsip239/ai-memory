@@ -3105,6 +3105,26 @@ async fn process_authorized(
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
+        let stop_metadata = if env.event == HookEvent::Stop
+            && state.wiki.observes_captured_stops()
+            && !sanitized.inner().body.is_empty()
+        {
+            result_delivery_revision(&env).map(|revision| {
+                Sanitized::for_stop_metadata(
+                    ai_memory_core::HookStopMetadata {
+                        reply: result_reply_text(&env, &state.sanitizer),
+                        subscription_revision: revision,
+                        artifact_refs: result_artifact_refs(&env, &state.sanitizer),
+                        artifact_cwd: env.cwd.clone(),
+                        agent_provider: env.agent,
+                        pane_key: result_pane_key(&env),
+                    },
+                    &state.sanitizer,
+                )
+            })
+        } else {
+            None
+        };
         let ingest_guard = if let Some(key) = ingest_key.as_deref() {
             Some(state.ingest_gates.lock(proj, key).await)
         } else {
@@ -3118,6 +3138,7 @@ async fn process_authorized(
                 owner_filter.clone(),
                 ingest_key.clone(),
                 moved_from_cwd.clone(),
+                stop_metadata,
             )
             .await;
         match result {
@@ -3207,10 +3228,7 @@ async fn process_authorized(
     }
     ws = admitted.workspace_id();
     proj = admitted.project_id();
-    if env.event == HookEvent::Stop
-        && result_delivery_revision(&env).is_some()
-        && state.wiki.observes_captured_stops()
-    {
+    if env.event == HookEvent::Stop && state.wiki.observes_captured_stops() {
         let inserted_id = match ingest {
             IngestObservationOutcome::Inserted(id) => Some(id),
             _ => None,
@@ -3219,10 +3237,13 @@ async fn process_authorized(
             .reader
             .hook_observation_receipt(ws, proj, session_id, inserted_id, ingest_key.clone())
             .await?;
-        let observation = observation.ok_or_else(|| {
+        let receipt = observation.ok_or_else(|| {
             anyhow::anyhow!("Stop receipt unavailable; refusing to substitute latest observation")
         })?;
-        if !observation.body.is_empty() {
+        let observation = receipt.observation;
+        if !observation.body.is_empty()
+            && let Some(metadata) = receipt.metadata
+        {
             state
                 .wiki
                 .notify_captured_stop(
@@ -3237,14 +3258,13 @@ async fn process_authorized(
                         observation_id: observation.id.to_string(),
                         session_id: session_id.to_string(),
                         created_us: observation.created_at.as_microsecond(),
-                        reply: result_reply_text(&env, &state.sanitizer)
-                            .unwrap_or_else(|| observation.body.clone()),
+                        reply: metadata.reply.unwrap_or_else(|| observation.body.clone()),
                         body: observation.body,
-                        subscription_revision: result_delivery_revision(&env),
-                        artifact_refs: result_artifact_refs(&env, &state.sanitizer),
-                        artifact_cwd: env.cwd.clone(),
-                        agent_provider: env.agent.as_str().to_owned(),
-                        pane_key: result_pane_key(&env),
+                        subscription_revision: Some(metadata.subscription_revision),
+                        artifact_refs: metadata.artifact_refs,
+                        artifact_cwd: metadata.artifact_cwd,
+                        agent_provider: metadata.agent_provider.as_str().to_owned(),
+                        pane_key: metadata.pane_key,
                     },
                 )
                 .await
@@ -10913,6 +10933,9 @@ mod tests {
         env.body_excerpt = Some("first committed result".into());
         env.ingest_key = Some("stable-stop".into());
         env.raw["coordination_subscription_revision"] = serde_json::json!(1);
+        env.raw["coordination_reply_text"] = serde_json::json!("original full reply reference");
+        env.raw["coordination_reply_refs"] = serde_json::json!(["./original.md"]);
+        env.raw["coordination_pane_key"] = serde_json::json!("original:pane");
         let error = process(&state, env.clone(), None, vec![])
             .await
             .unwrap_err();
@@ -10930,6 +10953,10 @@ mod tests {
         );
         assert_eq!(first["ctx"]["stop_result"]["body"], rows[0].body);
         env.body_excerpt = Some("different replay payload must not replace stored result".into());
+        env.raw["coordination_subscription_revision"] = serde_json::json!(0);
+        env.raw["coordination_reply_text"] = serde_json::json!("changed replay reply");
+        env.raw["coordination_reply_refs"] = serde_json::json!(["./changed.md"]);
+        env.raw["coordination_pane_key"] = serde_json::json!("changed:pane");
         process(&state, env.clone(), None, vec![]).await.unwrap();
         let replay = rx.recv().await.unwrap();
         assert_eq!(replay["ctx"]["stop_result"], first["ctx"]["stop_result"]);

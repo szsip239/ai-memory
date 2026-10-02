@@ -190,6 +190,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        stop_metadata: Option<ai_memory_core::HookStopMetadata>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -1262,6 +1263,7 @@ impl WriterHandle {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        stop_metadata: Option<Sanitized<ai_memory_core::HookStopMetadata>>,
     ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
@@ -1270,6 +1272,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            stop_metadata: stop_metadata.map(Sanitized::into_inner),
             reply: tx,
         })
         .await?;
@@ -3390,15 +3393,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                stop_metadata,
                 reply,
             } => {
-                let result = ops::admit_hook_session_event(
+                let result = ops::admit_hook_session_event_with_metadata(
                     &mut conn,
                     &session,
                     &obs,
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    stop_metadata.as_ref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }

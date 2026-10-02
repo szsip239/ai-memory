@@ -42,7 +42,7 @@ use std::sync::Arc;
 use regex::Regex;
 use tracing::debug;
 
-use crate::NewObservation;
+use crate::{HookStopMetadata, NewObservation};
 
 /// Universal durable-body ceiling for lifecycle observations. Event adapters
 /// may impose smaller limits, but no sanitized observation can cross the store
@@ -362,6 +362,62 @@ impl Sanitized<NewObservation> {
     }
 }
 
+impl Sanitized<HookStopMetadata> {
+    /// Scrub before bounding every persisted Stop field. Reference values that
+    /// would change under redaction are dropped rather than rewritten targets.
+    /// JSON-encoded budgets leave room for the excerpt and webhook context.
+    pub fn for_stop_metadata(mut metadata: HookStopMetadata, sanitizer: &Sanitizer) -> Self {
+        metadata.reply = metadata
+            .reply
+            .map(|value| {
+                let scrubbed = sanitizer.scrub(&value);
+                let mut bytes = 0;
+                scrubbed
+                    .chars()
+                    .take_while(|ch| {
+                        bytes += match ch {
+                            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+                            '\u{0}'..='\u{1f}' => 6,
+                            _ => ch.len_utf8(),
+                        };
+                        bytes <= 8_000
+                    })
+                    .collect()
+            })
+            .filter(|value: &String| !value.is_empty());
+        let safe_ref = |value: &str, max| {
+            !value.is_empty()
+                && !value.chars().any(char::is_control)
+                && sanitizer.scrub(value) == value
+                && serde_json::to_string(value).is_ok_and(|encoded| encoded.len() <= max)
+        };
+        metadata.artifact_cwd = metadata.artifact_cwd.filter(|v| safe_ref(v, 4096));
+        metadata.pane_key = metadata.pane_key.filter(|v| safe_ref(v, 512));
+        if metadata.artifact_refs.len() > 64 {
+            metadata.artifact_refs.clear();
+        } else {
+            let mut bytes = 0;
+            let mut refs = Vec::new();
+            for value in &metadata.artifact_refs {
+                if !safe_ref(value, 2048) {
+                    refs.clear();
+                    break;
+                }
+                bytes += serde_json::to_string(value).map_or(12_001, |s| s.len());
+                if bytes > 12_000 {
+                    refs.clear();
+                    break;
+                }
+                if !refs.contains(value) {
+                    refs.push(value.clone());
+                }
+            }
+            metadata.artifact_refs = refs;
+        }
+        Self(metadata)
+    }
+}
+
 /// Cap a (single-line) title to at most 80 displayed characters, appending an
 /// ellipsis when the input is longer. Applied by [`Sanitized::new`] to
 /// `NewObservation::title` — after redaction, not before, so a secret that
@@ -483,6 +539,27 @@ mod tests {
 
     fn s() -> Sanitizer {
         Sanitizer::builtin()
+    }
+
+    #[test]
+    fn stop_metadata_scrubs_secrets_and_bounds_json_encoded_reply() {
+        let secret = "Authorization: Bearer abcdef0123456789ABCDEF0123456789";
+        let metadata = HookStopMetadata {
+            reply: Some(format!("{secret}\n{}", "\"\\\0🙂".repeat(4000))),
+            subscription_revision: 1,
+            artifact_refs: vec!["./safe.md".into(), secret.into()],
+            artifact_cwd: Some(secret.into()),
+            agent_provider: crate::AgentKind::Codex,
+            pane_key: Some("unsafe\npane".into()),
+        };
+        let metadata = Sanitized::for_stop_metadata(metadata, &s()).into_inner();
+        let reply = metadata.reply.unwrap();
+        assert!(reply.contains("[REDACTED:"));
+        assert!(!reply.contains("abcdef0123"));
+        assert!(serde_json::to_string(&reply).unwrap().len() <= 8002);
+        assert!(metadata.artifact_refs.is_empty());
+        assert!(metadata.artifact_cwd.is_none());
+        assert!(metadata.pane_key.is_none());
     }
 
     #[test]

@@ -58,6 +58,7 @@ type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
 pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
+    require_stock_upgrade_compatibility()?;
     let exe = resolve_current_exe()?;
     ensure_supported_install(&exe)?;
 
@@ -77,6 +78,14 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
     println!("✓ upgraded to {tag}");
     info!(%tag, path = %exe.display(), "native upgrade complete");
     Ok(())
+}
+
+fn require_stock_upgrade_compatibility() -> Result<()> {
+    // Fork-owned gate: a verified stock archive still lacks our receipt
+    // protocol and deployed migration lineage. --force is not a schema override.
+    bail!(
+        "native upgrade is disabled for this locally patched build; stock releases would remove Stop/Kimi adapters and cannot open this database lineage. Build and validate a compatible patched candidate using docs/stop-result-receipts.md"
+    )
 }
 
 fn resolve_current_exe() -> Result<PathBuf> {

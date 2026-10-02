@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Froze selected Stop reply, artifact and routing metadata in the observation
+  transaction (local V73). Pending retries read the original snapshot even if
+  their envelope changes or clears its subscription marker.
+- Refused native stock self-upgrades in this local build before any download or
+  binary/hook replacement; `--force` does not bypass schema compatibility.
+
 ### Added
 - Retained local Kimi Stop capture through the existing wrapper-injected
   assistant excerpt, without removing upstream OpenCode capture support (#826).

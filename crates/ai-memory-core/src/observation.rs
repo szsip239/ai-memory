@@ -113,6 +113,24 @@ pub struct NewObservation {
     pub occurred_at: Option<i64>,
 }
 
+/// Immutable, bounded metadata accompanying a selected Stop observation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookStopMetadata {
+    /// Sanitized reply text or an immutable local reply reference.
+    pub reply: Option<String>,
+    /// Original subscription revision, not execution authorization.
+    pub subscription_revision: u64,
+    /// Bounded, sanitized artifact references from the original Stop.
+    pub artifact_refs: Vec<String>,
+    /// Original working directory, when safe to retain.
+    pub artifact_cwd: Option<String>,
+    /// Admitted closed provider identity.
+    pub agent_provider: AgentKind,
+    /// Original pane correlation, never a grant to send input.
+    pub pane_key: Option<String>,
+}
+
 /// Materialised view of an observation row.
 #[derive(Clone, Debug)]
 pub struct Observation {

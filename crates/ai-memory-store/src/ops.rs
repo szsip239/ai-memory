@@ -2406,6 +2406,7 @@ pub fn insert_observation_keyed(
 /// `moved_from_cwd` marks an explicit native relocation (OpenCode
 /// `session.moved`): when the stored cwd still matches it, the live session
 /// row is rebound to this event's scope and cwd in the same transaction.
+#[cfg(test)]
 pub fn admit_hook_session_event(
     conn: &mut Connection,
     session: &NewSession,
@@ -2413,6 +2414,26 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+) -> StoreResult<HookSessionAdmission> {
+    admit_hook_session_event_with_metadata(
+        conn,
+        session,
+        obs,
+        owner_filter,
+        ingest_key,
+        moved_from_cwd,
+        None,
+    )
+}
+
+pub(crate) fn admit_hook_session_event_with_metadata(
+    conn: &mut Connection,
+    session: &NewSession,
+    obs: &NewObservation,
+    owner_filter: &OwnerFilter,
+    ingest_key: Option<&str>,
+    moved_from_cwd: Option<&str>,
+    stop_metadata: Option<&ai_memory_core::HookStopMetadata>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -2579,6 +2600,52 @@ pub fn admit_hook_session_event(
     } else {
         IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
     };
+    if let Some(metadata) = stop_metadata {
+        if obs.kind != ObservationKind::Stop
+            || metadata.subscription_revision == 0
+            || metadata.agent_provider != session.agent_kind
+        {
+            return Err(StoreError::InvalidState(
+                "Stop metadata does not match its admitted capture".into(),
+            ));
+        }
+        let id = match ingest {
+            IngestObservationOutcome::Inserted(id) => Some(id.as_bytes().to_vec()),
+            IngestObservationOutcome::ResumePending => tx
+                .query_row(
+                    "SELECT observation_id FROM ingest_keys WHERE project_id=?1 AND key=?2",
+                    params![project_id.as_bytes(), ingest_key],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten(),
+            IngestObservationOutcome::AlreadyComplete => None,
+        };
+        if let Some(id) = id {
+            let existing: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hook_stop_metadata WHERE observation_id=?1)",
+                [&id],
+                |row| row.get(0),
+            )?;
+            if !existing {
+                // A pre-V73 pending event can attach its retained native-spool
+                // metadata once, but never to a mismatched committed excerpt.
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM observations WHERE id=?1 AND workspace_id=?2 AND project_id=?3 AND session_id=?4 AND kind='stop' AND body=?5)",
+                    params![id, workspace_id.as_bytes(), project_id.as_bytes(), session.id.as_bytes(), obs.body], |row| row.get(0),
+                )?;
+                if !matches {
+                    return Err(StoreError::InvalidState(
+                        "legacy Stop metadata has a different committed excerpt".into(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO hook_stop_metadata(observation_id,metadata_json) VALUES (?1,?2)",
+                    params![id, serde_json::to_string(metadata)?],
+                )?;
+            }
+        }
+    }
     // Compare-and-set on the source cwd so a stale or out-of-order move never
     // rebinds a newer location. Only the first admission of a keyed move may
     // rebind: a redelivery (complete or resumed) already had its chance in the
@@ -7393,6 +7460,138 @@ pub(crate) mod tests {
             body: "observation".into(),
             importance: 5,
         }
+    }
+
+    #[test]
+    fn immutable_stop_metadata_is_atomic_scoped_and_cascades_with_capture() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, None);
+        let mut obs = hook_observation(&session);
+        obs.kind = ObservationKind::Stop;
+        let mut metadata = ai_memory_core::HookStopMetadata {
+            reply: Some("original reply reference".into()),
+            subscription_revision: 1,
+            artifact_refs: vec!["./original.md".into()],
+            artifact_cwd: None,
+            agent_provider: AgentKind::KimiCode,
+            pane_key: Some("original:pane".into()),
+        };
+        assert!(
+            admit_hook_session_event_with_metadata(
+                &mut conn,
+                &session,
+                &obs,
+                &OwnerFilter::Any,
+                Some("stop"),
+                None,
+                Some(&metadata)
+            )
+            .is_err()
+        );
+        for table in [
+            "sessions",
+            "observations",
+            "ingest_keys",
+            "hook_stop_metadata",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "invalid metadata must roll back {table}");
+        }
+        metadata.agent_provider = AgentKind::Codex;
+        admit_hook_session_event_with_metadata(
+            &mut conn,
+            &session,
+            &obs,
+            &OwnerFilter::Any,
+            Some("stop"),
+            None,
+            Some(&metadata),
+        )
+        .unwrap();
+        let original = serde_json::to_string(&metadata).unwrap();
+        metadata.reply = Some("changed replay".into());
+        metadata.subscription_revision = 2;
+        obs.body = "changed excerpt".into();
+        admit_hook_session_event_with_metadata(
+            &mut conn,
+            &session,
+            &obs,
+            &OwnerFilter::Any,
+            Some("stop"),
+            None,
+            Some(&metadata),
+        )
+        .unwrap();
+        let retained: String = conn
+            .query_row("SELECT metadata_json FROM hook_stop_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained, original);
+        conn.execute("DELETE FROM observations", []).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hook_stop_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn legacy_pending_stop_attaches_retained_metadata_only_to_matching_excerpt() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, None);
+        let mut obs = hook_observation(&session);
+        obs.kind = ObservationKind::Stop;
+        admit_hook_session_event(
+            &mut conn,
+            &session,
+            &obs,
+            &OwnerFilter::Any,
+            Some("legacy"),
+            None,
+        )
+        .unwrap();
+        let metadata = ai_memory_core::HookStopMetadata {
+            reply: Some("retained native spool reference".into()),
+            subscription_revision: 1,
+            artifact_refs: vec![],
+            artifact_cwd: None,
+            agent_provider: AgentKind::Codex,
+            pane_key: None,
+        };
+        let mut wrong = obs.clone();
+        wrong.body = "foreign replay excerpt".into();
+        assert!(
+            admit_hook_session_event_with_metadata(
+                &mut conn,
+                &session,
+                &wrong,
+                &OwnerFilter::Any,
+                Some("legacy"),
+                None,
+                Some(&metadata)
+            )
+            .is_err()
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hook_stop_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        admit_hook_session_event_with_metadata(
+            &mut conn,
+            &session,
+            &obs,
+            &OwnerFilter::Any,
+            Some("legacy"),
+            None,
+            Some(&metadata),
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hook_stop_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// Seed a session with one observation and a derived page, return the ids.

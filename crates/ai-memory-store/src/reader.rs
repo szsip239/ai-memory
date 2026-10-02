@@ -39,6 +39,14 @@ use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
 use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
+/// One exact committed observation and its immutable Stop metadata.
+pub struct HookObservationReceipt {
+    /// Captured excerpt and admitted source tuple.
+    pub observation: Observation,
+    /// Absent only for legacy or unselected captures.
+    pub metadata: Option<ai_memory_core::HookStopMetadata>,
+}
+
 /// TTL guard for retrieval surfaces (search / recent / embedding hits /
 /// graph neighbours / briefing lists): appended to a WHERE clause that
 /// already constrains `is_latest = 1`. `table` is the pages alias in
@@ -2837,15 +2845,20 @@ impl ReaderPool {
         session_id: SessionId,
         observation_id: Option<ai_memory_core::ObservationId>,
         ingest_key: Option<String>,
-    ) -> StoreResult<Option<Observation>> {
+    ) -> StoreResult<Option<HookObservationReceipt>> {
         self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, importance, created_at \
-                 FROM observations WHERE workspace_id=?1 AND project_id=?2 AND session_id=?3 \
-                 AND id=COALESCE(?4, (SELECT observation_id FROM ingest_keys WHERE project_id=?2 AND key=?5))",
+            let row = conn.query_row(
+                "SELECT o.id, o.session_id, o.workspace_id, o.project_id, o.kind, o.extension, o.source_event, o.title, o.body, o.importance, o.created_at, m.metadata_json \
+                 FROM observations o LEFT JOIN hook_stop_metadata m ON m.observation_id=o.id \
+                 WHERE o.workspace_id=?1 AND o.project_id=?2 AND o.session_id=?3 \
+                 AND o.id=COALESCE(?4, (SELECT observation_id FROM ingest_keys WHERE project_id=?2 AND key=?5))",
                 params![workspace_id.as_bytes(), project_id.as_bytes(), session_id.as_bytes(), observation_id.map(|id| id.as_bytes().to_vec()), ingest_key],
-                row_to_observation,
-            ).optional()?.transpose()
+                |row| Ok((row_to_observation(row)?, row.get::<_, Option<String>>(11)?)),
+            ).optional()?;
+            row.map(|(observation, metadata)| Ok(HookObservationReceipt {
+                observation: observation?,
+                metadata: metadata.map(|json| serde_json::from_str(&json)).transpose()?,
+            })).transpose()
         }).await
     }
 

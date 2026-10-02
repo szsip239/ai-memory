@@ -77,3 +77,24 @@ and existing counts retained, then run the native-spool fault/replay suite.
 Keep the old binary; after applying V69–V72 it cannot reopen the new database,
 so binary-only rollback is not valid. A database restore requires stopping
 capture and reconciling post-upgrade observations first.
+
+## Immutable metadata revision
+
+Local V73 stores bounded, sanitized Stop metadata alongside the observation in
+one writer transaction. Reply/artifact references, provider, cwd, pane and the
+subscription revision are read from that immutable snapshot on every pending
+retry, including a replay that clears its original selection marker. This does
+not add capture for unselected events or turn metadata into execution authority.
+The original source tuple still gates reads; observation deletion cascades to
+its metadata, and no raw transcript is copied into this table.
+
+Pre-V73 pending events have no historical metadata row. Their retained native
+spool metadata can be attached once, only when its admitted source tuple and
+sanitized excerpt match the committed observation. This cannot reconstruct
+metadata that an older deployment never retained; no latest-result lookup or
+invented backfill is used.
+
+The local native `upgrade` command now refuses stock replacement before any
+download or binary/hook mutation, even with `--force`. Use a compatible patched
+candidate and isolated database verification instead. V73 also means the prior
+local V72 binary is not a binary-only rollback target.

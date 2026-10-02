@@ -124,7 +124,7 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "{table}.{column} must survive the upgrade");
         }
-        assert_eq!(applied_versions(&conn).last(), Some(&72));
+        assert_eq!(applied_versions(&conn).last(), Some(&73));
         run(&mut conn).unwrap();
         assert_eq!(history(&conn), before);
     }
