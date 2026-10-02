@@ -54,3 +54,26 @@ Existing native spool age/capacity limits still apply; this is not an unlimited
 offline-retention guarantee. Unknown downstream mail/notification outcomes must
 remain visible, not be blindly replayed. Consumers recheck subscription versions
 before delivery and attention; accepting a receipt does not mean either happened.
+
+## Local 2.5.2 upgrade lineage
+
+This is a patched deployment, not an official-binary-compatible store. Do not
+replace it with a stock release: deployed V65 is `hook_observation_receipts`,
+V67 is `page_compacted_marker`, and V68 is `auto_improve_claim_attempts`.
+Those files and their checksums stay unchanged. Upstream V67–V70 are mapped
+to V69–V72 (`managed_run_session_link`, `project_grants`, `project_created_by`,
+`project_identity`). The V66 gap is intentional; never rewrite migration history
+to make it contiguous. Future releases must preserve this mapping.
+
+Upstream 2.5.2 already includes the CLI message-send observer/admission fix
+(#756); the local duplicate is no longer applied. Kimi capture still needs
+the local wrapper-injected excerpt; preserve upstream OpenCode capture when
+porting that closed-table extension. Stop callbacks run after project write
+authorization and session admission, never instead of either.
+
+Before activation, back up the store and configuration, test a SQLite online
+backup with LLM/watcher/backfill disabled, check old migration rows unchanged
+and existing counts retained, then run the native-spool fault/replay suite.
+Keep the old binary; after applying V69–V72 it cannot reopen the new database,
+so binary-only rollback is not valid. A database restore requires stopping
+capture and reconciling post-upgrade observations first.

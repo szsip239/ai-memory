@@ -63,9 +63,10 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {
-        (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::KimiCode, HookEvent::Stop) => {
-            Some("last_assistant_message")
-        }
+        (
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::KimiCode,
+            HookEvent::Stop,
+        ) => Some("last_assistant_message"),
         _ => None,
     }
 }
@@ -250,7 +251,10 @@ mod tests {
             for event in events {
                 let expected = matches!(
                     agent,
-                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::KimiCode
+                    AgentKind::ClaudeCode
+                        | AgentKind::Codex
+                        | AgentKind::OpenCode
+                        | AgentKind::KimiCode
                 ) && event == HookEvent::Stop;
                 assert_eq!(
                     assistant_message_field(agent, event).is_some(),

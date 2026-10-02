@@ -10948,18 +10948,26 @@ mod tests {
                 .len(),
             1
         );
-        let wrong_scope = state
-            .reader
-            .hook_observation_receipt(
-                WorkspaceId::new(),
-                rows[0].project_id,
-                session,
-                Some(rows[0].id),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(wrong_scope.is_none());
+        for (ws, proj, native_session) in [
+            (WorkspaceId::new(), rows[0].project_id, session),
+            (rows[0].workspace_id, ProjectId::new(), session),
+            (rows[0].workspace_id, rows[0].project_id, SessionId::new()),
+        ] {
+            for (id, key) in [
+                (Some(rows[0].id), None),
+                (None, Some("stable-stop".to_owned())),
+            ] {
+                let wrong_scope = state
+                    .reader
+                    .hook_observation_receipt(ws, proj, native_session, id, key)
+                    .await
+                    .unwrap();
+                assert!(
+                    wrong_scope.is_none(),
+                    "foreign scope/session must not resolve a receipt"
+                );
+            }
+        }
         server.abort();
     }
 
@@ -10986,6 +10994,81 @@ mod tests {
             process(&state, env, None, vec![])
                 .await
                 .expect("must not call unavailable result receiver");
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_stop_cannot_bypass_project_write_authorization() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state_with_admission(
+            &tmp,
+            refusing_admission_chain("unavailable", vec![AdmissionOp::StopCaptured]),
+        )
+        .await;
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let probe = SessionId::new();
+        capture_as(&state, tmp.path(), &probe.to_string(), None)
+            .await
+            .unwrap();
+        let landed = state.reader.observations_for_session(probe).await.unwrap()[0].project_id;
+        let reader = user_holding(
+            &state,
+            "receipt-reader",
+            landed,
+            Some(ai_memory_store::GrantLevel::Read),
+        )
+        .await;
+        let stranger = user_holding(&state, "receipt-stranger", landed, None).await;
+        let writer = user_holding(
+            &state,
+            "receipt-writer",
+            landed,
+            Some(ai_memory_store::GrantLevel::Write),
+        )
+        .await;
+        for (user, allowed) in [(reader, false), (stranger, false), (writer, true)] {
+            let session = SessionId::new();
+            let mut env =
+                session_envelope("stop", &session.to_string(), &tmp.path().to_string_lossy());
+            // Match capture_as's restricted cwd scope instead of the helper's
+            // explicitly named open scratch project.
+            env.workspace_override = None;
+            env.project_override = None;
+            env.body_excerpt = Some("selected result".into());
+            env.ingest_key = Some(format!("receipt-{session}"));
+            env.raw["coordination_subscription_revision"] = serde_json::json!(1);
+            let err = process_authorized(
+                &state,
+                env,
+                None,
+                ai_memory_core::AuthLevel::User,
+                vec![],
+                Some(user),
+            )
+            .await
+            .unwrap_err();
+            let rows = state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap();
+            if allowed {
+                assert!(
+                    err.is::<StopDeliveryPending>(),
+                    "writer reaches the receiver: {err}"
+                );
+                assert_eq!(rows.len(), 1);
+            } else {
+                assert!(
+                    err.is::<CaptureNotAuthorized>(),
+                    "selection cannot authorize capture: {err}"
+                );
+                assert!(rows.is_empty());
+            }
         }
     }
 

@@ -76,6 +76,59 @@ mod tests {
     };
     use rusqlite::{Connection, params};
 
+    #[test]
+    fn deployed_local_lineage_upgrades_without_rewriting_history() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 68).unwrap();
+        let history = |conn: &Connection| {
+            conn.prepare("SELECT version, name, checksum FROM refinery_schema_history WHERE version <= 68 ORDER BY version")
+                .unwrap().query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let before = history(&conn);
+        assert!(
+            before
+                .iter()
+                .any(|(v, n, _)| *v == 65 && n == "hook_observation_receipts")
+        );
+        assert!(
+            before
+                .iter()
+                .any(|(v, n, _)| *v == 67 && n == "page_compacted_marker")
+        );
+        assert!(
+            before
+                .iter()
+                .any(|(v, n, _)| *v == 68 && n == "auto_improve_claim_attempts")
+        );
+        assert!(!before.iter().any(|(v, _, _)| *v == 66));
+        run(&mut conn).unwrap();
+        assert_eq!(
+            history(&conn),
+            before,
+            "never rewrite deployed migration receipts"
+        );
+        assert_eq!(schema_object_count(&conn, "table", "project_grants"), 1);
+        for (table, column) in [
+            ("managed_runs", "native_session_linked_at"),
+            ("projects", "created_by"),
+            ("projects", "identity"),
+            ("ingest_keys", "observation_id"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}.{column} must survive the upgrade");
+        }
+        assert_eq!(applied_versions(&conn).last(), Some(&72));
+        run(&mut conn).unwrap();
+        assert_eq!(history(&conn), before);
+    }
+
     /// A store migrated by a newer build (an applied version above anything
     /// this binary embeds) must fail to open with the actionable
     /// `DataSchemaAhead` error, not refinery's raw "missing from the

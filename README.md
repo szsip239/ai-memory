@@ -501,3 +501,10 @@ MIT - see [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
+
+## Local result-delivery build
+
+This checkout retains opt-in Stop receipts and the Kimi capture adapter on the
+2.5.2 release. Its deployed migration lineage is not compatible with a stock
+binary replacement. See [local receipts and upgrade mapping](docs/stop-result-receipts.md#local-252-upgrade-lineage)
+before installing a later release or rolling back.
