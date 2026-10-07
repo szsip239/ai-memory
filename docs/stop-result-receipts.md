@@ -117,11 +117,29 @@ review process is authoritative, and set `[run] require_server = true` to retain
 the pre-2.6 fail-closed managed launch policy.
 
 For legacy project names, use verified operator-home routes instead of letting
-the new path-style default rename or split an existing scope. Route request keys
-must be lowercase; the stored legacy spelling and UUID must be verified through
-real capture against a database copy. Do not install guessed or ambiguous routes.
+the new path-style default rename or split an existing scope. Operator-home route project values must be lowercase. Identityless mixed-case
+legacy names need exact per-checkout markers instead; lowercasing them can create
+a second project. Verify stored spelling and UUID through real capture against
+a database copy. Do not install guessed or ambiguous routes.
 No production change is permitted until those routing and receipt checks pass.
 
 After V79, the previous V73 binary is not a binary-only rollback target. Keep the
 pre-upgrade database/configuration snapshot and reconcile any post-upgrade writes
 before restoring it; never rewrite `refinery_schema_history` to force a downgrade.
+
+## Deferred receipt transport safety
+
+A complete `/hook/batch` scan always emits explicit `accepted_indices`, including
+an accepted prefix followed by a deferred Stop. This distinguishes receipt
+backpressure from a permanent failure and never charges the retained Stop's retry
+budget. Failed scans additionally name the actual `failed_index`.
+
+A keyed asynchronous Stop with a cleared selection marker is classified through
+the same authorized scope/session/key admission gate. If immutable metadata says
+it is selected, `/hook` returns retryable 429 before notification or key completion;
+it must recover through native batch receipts. Fresh unselected keyed requests
+remain 202 with asynchronous downstream work. Admission classification waits at
+most 200 ms; timeout never acknowledges an unclassified selected result. No raw
+session-id lookup or unlocked preflight substitutes for normal authorization.
+Receiver-only retries do not advance `last_persisted_ms`; real durable insertion
+already records that timestamp inside the processor.

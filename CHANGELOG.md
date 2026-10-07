@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Preserved native deferred-suffix Stop receipts at the retry cap with explicit
+  full-scan ACK indexes; kept cleared-marker async retries behind the authorized
+  immutable-receipt checkpoint and bounded retryable admission (downstream #826).
+- Stopped receipt-only retries from reporting a new durable-write timestamp
+  (downstream #826).
 - Froze selected Stop reply, artifact and routing metadata in the observation
   transaction (local V73). Pending retries read the original snapshot even if
   their envelope changes or clears its subscription marker.

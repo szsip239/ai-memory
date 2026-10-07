@@ -89,6 +89,21 @@ impl std::fmt::Display for StopDeliveryPending {
 }
 impl std::error::Error for StopDeliveryPending {}
 
+#[derive(Debug)]
+struct StopRequiresBatch;
+impl std::fmt::Display for StopRequiresBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("immutable selected Stop requires native batch receipts")
+    }
+}
+impl std::error::Error for StopRequiresBatch {}
+
+#[derive(Debug)]
+enum AsyncStopAdmission {
+    SafeToQueue,
+    RequiresBatch,
+}
+
 fn result_delivery_revision(env: &HookEnvelope) -> Option<u64> {
     env.raw
         .get("coordination_subscription_revision")
@@ -797,6 +812,46 @@ async fn handle_hook(
         return (StatusCode::TOO_MANY_REQUESTS, "hook source rate limited");
     }
     state.ingest_metrics.record_accepted();
+    // A keyed legacy/plugin replay can clear the current selection marker.
+    // Classify under the same authorized project/key gate as capture, not an
+    // unlocked raw-session lookup. Only DB admission precedes this bounded ACK;
+    // unselected downstream work remains asynchronous.
+    if env.event == HookEvent::Stop
+        && env.ingest_key.is_some()
+        && state.wiki.observes_captured_stops()
+    {
+        if resolve_session_id(&env).is_err() {
+            HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+            return (StatusCode::ACCEPTED, "invalid Stop session dropped");
+        }
+        let (ready, acknowledgment) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = process_envelope_with_readiness(
+                state,
+                env,
+                actor,
+                level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
+                skip_webhooks,
+                viewer,
+                Some(ready),
+            )
+            .await;
+        });
+        return match tokio::time::timeout(std::time::Duration::from_millis(200), acknowledgment)
+            .await
+        {
+            Ok(Ok(AsyncStopAdmission::SafeToQueue)) => (StatusCode::ACCEPTED, "queued"),
+            Ok(Ok(AsyncStopAdmission::RequiresBatch)) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "pending selected Stop requires native /hook/batch receipts",
+            ),
+            _ => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Stop admission pending; retry",
+            ),
+        };
+    }
     tokio::spawn(async move {
         let _permit = permit;
         let _ = process_envelope(
@@ -888,9 +943,9 @@ pub struct HookBatchAck {
     pub accepted: usize,
     /// Results only for acknowledged request indices.
     pub results: Vec<HookBatchResult>,
-    /// Non-contiguous item indexes acknowledged by a server new enough to keep
-    /// scanning past per-source rate-limited items. Omitted when it is exactly
-    /// the legacy accepted prefix so older clients keep working.
+    /// Item indexes acknowledged by a complete scan, including contiguous
+    /// prefixes with a deferred suffix. Compact early-rejection responses may
+    /// omit this field; full scans always include it so retry budgets are safe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_indices: Option<Vec<usize>>,
     /// Item index that failed processing after earlier rate-limited skips. New
@@ -928,7 +983,7 @@ impl HookBatchAck {
 
     fn indexed_with_empty(
         indices: Vec<usize>,
-        include_empty_indices: bool,
+        force_indices: bool,
         failed_index: Option<usize>,
     ) -> Self {
         let legacy_prefix = indices
@@ -945,7 +1000,7 @@ impl HookBatchAck {
         Self {
             accepted: legacy_prefix,
             results: Vec::new(),
-            accepted_indices: if contiguous && !(include_empty_indices && indices.is_empty()) {
+            accepted_indices: if contiguous && !force_indices {
                 None
             } else {
                 Some(indices)
@@ -1105,7 +1160,6 @@ async fn handle_hook_batch(
             Err(e) if e.is::<StopDeliveryPending>() => {
                 // The observation committed. Retain only this native receipt,
                 // without consuming retries or starving unrelated captures.
-                state.ingest_metrics.record_persisted(now_unix_ms());
                 warn!("Stop receiver unavailable; retained native spool receipt");
                 continue;
             }
@@ -3267,8 +3321,32 @@ async fn process_envelope(
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> Option<HookProcessingOutcome> {
+    process_envelope_with_readiness(state, env, actor, level, skip_webhooks, viewer, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_envelope_with_readiness(
+    state: Arc<HookState>,
+    env: HookEnvelope,
+    actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
+    skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
+    mut readiness: Option<tokio::sync::oneshot::Sender<AsyncStopAdmission>>,
+) -> Option<HookProcessingOutcome> {
     let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
-    let outcome = match process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
+    let outcome = match process_authorized_with_readiness(
+        &state,
+        env,
+        actor,
+        level,
+        skip_webhooks,
+        viewer,
+        &mut readiness,
+    )
+    .await
+    {
+        Err(error) if error.is::<StopRequiresBatch>() => return None,
         Ok(outcome) => outcome,
         Err(e) if e.downcast_ref::<CaptureNotAuthorized>().is_some() => {
             warn!("capture dropped: author may not write this project");
@@ -3295,6 +3373,9 @@ async fn process_envelope(
             return None;
         }
     };
+    if let Some(ready) = readiness.take() {
+        let _ = ready.send(AsyncStopAdmission::SafeToQueue);
+    }
     outcome.record(&state.ingest_metrics);
     Some(outcome)
 }
@@ -3401,6 +3482,20 @@ async fn process_authorized(
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
+) -> anyhow::Result<HookProcessingOutcome> {
+    process_authorized_with_readiness(state, env, actor, level, skip_webhooks, viewer, &mut None)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_authorized_with_readiness(
+    state: &HookState,
+    env: HookEnvelope,
+    actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
+    skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
+    readiness: &mut Option<tokio::sync::oneshot::Sender<AsyncStopAdmission>>,
 ) -> anyhow::Result<HookProcessingOutcome> {
     if env.aliases_invalid {
         return Err(anyhow::anyhow!("invalid marker aliases"));
@@ -3798,6 +3893,12 @@ async fn process_authorized(
         if !observation.body.is_empty()
             && let Some(metadata) = receipt.metadata
         {
+            if let Some(ready) = readiness.take() {
+                // This decision uses immutable metadata after scope/write/owner
+                // admission and keyed-ingest serialization, before any notify.
+                let _ = ready.send(AsyncStopAdmission::RequiresBatch);
+                return Err(StopRequiresBatch.into());
+            }
             state
                 .wiki
                 .notify_captured_stop(
@@ -3824,6 +3925,9 @@ async fn process_authorized(
                 .await
                 .map_err(|_| StopDeliveryPending)?;
         }
+    }
+    if let Some(ready) = readiness.take() {
+        let _ = ready.send(AsyncStopAdmission::SafeToQueue);
     }
     if let Some(run_id) = managed_run
         && let Some(native_session_id) = env.session_id.as_deref().and_then(|value| {
@@ -4751,6 +4855,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn full_scan_and_failure_acks_keep_contiguous_indices_explicit() {
+        let scanned = serde_json::to_value(HookBatchAck::indexed_full_scan(vec![0])).unwrap();
+        assert_eq!(scanned["accepted"], 1);
+        assert_eq!(scanned["accepted_indices"], serde_json::json!([0]));
+        assert!(scanned.get("failed_index").is_none());
+        let failed = serde_json::to_value(HookBatchAck::indexed_failed(vec![0], 2)).unwrap();
+        assert_eq!(failed["accepted_indices"], serde_json::json!([0]));
+        assert_eq!(failed["failed_index"], 2);
+    }
     use crate::payload::HookQuery;
 
     #[test]
@@ -11227,7 +11342,7 @@ mod tests {
             serde_json::json!([{ "index": 0, "outcome": "dropped_collision" }, { "index": 1, "outcome": "stored" }])
         );
         assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
-        assert!(ack.get("accepted_indices").is_none() || ack["accepted_indices"].is_null());
+        assert_eq!(ack["accepted_indices"], serde_json::json!([0, 1]));
         assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
         assert_eq!(
             state
