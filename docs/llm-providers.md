@@ -49,8 +49,8 @@ Recommended defaults:
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
-| `opencode` | `claude-sonnet-4-6` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
@@ -91,10 +91,24 @@ allowance rather than per-token billing. Set
 `config.toml`) for **Zen**'s pay-per-token catalogue. Model ids are per
 catalogue and written plainly (`mimo-v2.5`, `glm-5.3-flash`), not in the
 `opencode-go/<model>` form OpenCode's own client config uses. The built-in
-default is `claude-sonnet-4-6`; Go ids such as `mimo-v2.5` or `glm-5.3-flash`
-come from `AI_MEMORY_LLM_MODEL`, so set it to an id the endpoint you chose
-serves. `gpt-5.6-luna` is sent through the Responses endpoint;
-every other model uses Chat Completions. The provider sends the
+default is `mimo-v2.6-flash`, served by Go. When selecting Zen, set
+`AI_MEMORY_LLM_MODEL` to a model from its catalogue, such as `claude-sonnet-5-5`.
+The provider preserves the chosen catalogue and does not switch billing products
+automatically. Published Responses models, including `gpt-5.6-luna` and
+`gpt-6-luna`, use `/responses`. The wire API follows the selected catalogue:
+`minimax-m3`, `minimax-m2.7`, and `qwen3.8-max` use `/messages` on Go and
+Chat Completions on Zen. Go's `muse-spark-1.3-contributor` and
+`muse-spark-1.2-contributor` use `/responses`. Supported Claude and the other
+mapped Qwen models use `/messages`; remaining models retain Chat Completions.
+Changing the base URL reselects the transport and preserves timeout, reasoning
+effort, and operator headers. Go is identified by a URL path ending in
+`/zen/go` or `/zen/go/v1`, optionally including a complete endpoint;
+custom proxy URLs with other paths use the Zen mapping.
+See the official [Go endpoints](https://opencode.ai/docs/go/#endpoints) and
+[Zen endpoints](https://opencode.ai/docs/zen/#endpoints), whose source tables
+are [go.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/go.mdx)
+and [zen.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/zen.mdx).
+The provider sends the
 `x-opencode-session` correlation header OpenCode asks for, one id per logical
 operation, and its own `User-Agent`; `AI_MEMORY_LLM_HEADERS` overrides
 either. `AI_MEMORY_LLM_REASONING_EFFORT` and `AI_MEMORY_LLM_TIMEOUT_SECS`
@@ -105,8 +119,17 @@ chosen by the base URL, not the alias.
 
 ```bash
 export AI_MEMORY_LLM_PROVIDER=opencode
-export AI_MEMORY_LLM_MODEL=mimo-v2.5
-ai-memory llm-test --provider opencode --model mimo-v2.5 --prompt "Reply with OK"
+export AI_MEMORY_LLM_MODEL=mimo-v2.6-flash
+ai-memory llm-test --provider opencode --model mimo-v2.6-flash --prompt "Reply with OK"
+```
+
+For Claude through Zen:
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=opencode
+export AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1
+export AI_MEMORY_LLM_MODEL=claude-sonnet-5-5
+ai-memory llm-test --provider opencode --model claude-sonnet-5-5 --prompt "Reply with OK"
 ```
 
 <a id="openrouter"></a>
@@ -202,6 +225,24 @@ avoids hosted egress; for non-English content, a multilingual hosted model
 provider that exposes a real `/v1/embeddings` endpoint is the practical choice.
 The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
 alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
+
+> [!TIP]
+> **`openai-compat` sends `X-Request-Id` on every chat attempt.** Each HTTP
+> attempt of one logical operation — including the strict-to-tolerant
+> fallback — carries the same operation id (a 36-character UUID v7) in the
+> `X-Request-Id` header, so a gateway that records it (for example as
+> `req=<id>`) can correlate every attempt of the same operation and forward
+> it to the engine (vLLM). The id is generated fresh by the caller of the
+> operation — the consolidation invocation or the auto-improve review — and
+> is never the agent's session id, so a gateway never sees two operations
+> of one session, or a crash-resumed run, as one. Crash re-entry is exactly
+> one new operation: a process restart or a queue re-claim mints a new id
+> for the calls it makes. The official `openai` provider and `opencode` do
+> not send this header — `opencode` keeps its own `x-opencode-session`
+> contract. Because ai-memory owns the header on the `openai-compat` path, a
+> static `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at
+> startup for that provider; the dynamic value must not be shadowed or
+> duplicated.
 
 ### Security and gotchas
 
@@ -424,7 +465,7 @@ sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra
 examples, and
 [`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

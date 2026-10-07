@@ -98,3 +98,30 @@ The local native `upgrade` command now refuses stock replacement before any
 download or binary/hook mutation, even with `--force`. Use a compatible patched
 candidate and isolated database verification instead. V73 also means the prior
 local V72 binary is not a binary-only rollback target.
+
+## Local 2.6.0 compatibility
+
+The pinned upstream release is v2.6.0. Its new V71–V76 migrations are appended
+as local V74–V79 (`managed_run_owner`, `sessions_grizzybot_agent_kind`,
+`sessions_copilot_cli_agent_kind`, `project_profile_flags`, `profile_candidates`,
+`project_coordinate_keys`). The SQL is unchanged; only its versioned filenames
+move. Every deployed migration through V73, including the intentional V66 gap,
+keeps its original name and checksum. Immutable Stop metadata remains V73.
+
+Before replacing an existing local build, verify a complete online database
+snapshot: old migration receipts, every old table's values, session references,
+embeddings, grants, pages and metadata must survive unchanged. Read-side access
+telemetry may advance only after an explicit query. Keep profile harvesting
+disabled (`[profile] enabled = false`) when an existing operator preference
+review process is authoritative, and set `[run] require_server = true` to retain
+the pre-2.6 fail-closed managed launch policy.
+
+For legacy project names, use verified operator-home routes instead of letting
+the new path-style default rename or split an existing scope. Route request keys
+must be lowercase; the stored legacy spelling and UUID must be verified through
+real capture against a database copy. Do not install guessed or ambiguous routes.
+No production change is permitted until those routing and receipt checks pass.
+
+After V79, the previous V73 binary is not a binary-only rollback target. Keep the
+pre-upgrade database/configuration snapshot and reconcile any post-upgrade writes
+before restoring it; never rewrite `refinery_schema_history` to force a downgrade.

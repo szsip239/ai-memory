@@ -89,6 +89,10 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -189,6 +193,103 @@ fn macos_release_tarball_ships_the_launchd_agent_plist() {
         release.contains(LAUNCHD_AGENT_PLIST),
         "the macOS tarball smoke test must prove the plist actually shipped"
     );
+}
+
+/// Source lock: Unix release packing must disable macOS AppleDouble sidecars
+/// (`._*`) so Linux runners and macOS producers emit the same archive layout
+/// upgrade's allowlist expects (see `extracts_archive_built_like_release_yml`).
+#[test]
+fn unix_release_tarball_packing_disables_appledouble_sidecars() {
+    let release = read_repo(".github/workflows/release.yml");
+    let pack = "COPYFILE_DISABLE=1 tar -C \"dist/$artifact\" -czf \"$artifact.tar.gz\" .";
+    assert!(
+        release.matches(pack).count() >= 2,
+        "Linux and macOS release pack steps must set COPYFILE_DISABLE=1"
+    );
+}
+
+/// Drift lock for #1025: every top-level name staged into a release archive
+/// by `release.yml` must be extractable or listed in upgrade's exact support
+/// consts (`RELEASE_SUPPORT_*`). Direction is release → allowlist (Windows
+/// correctly omits `packaging/`). Catching a new `dist/$artifact/share`
+/// without an allowlist update keeps CI red before a live tarball upgrade
+/// fails after checksum.
+#[test]
+fn release_yml_staged_top_levels_are_upgrade_allowlisted() {
+    let release = read_repo(".github/workflows/release.yml");
+    let staged = release_yml_staged_top_levels(&release);
+    assert!(
+        staged.contains("hooks") && staged.contains("docs") && staged.contains("crates"),
+        "sanity: release.yml must still stage shared top-levels; got {staged:?}"
+    );
+
+    let upgrade = read_repo("crates/ai-memory-cli/src/commands/upgrade.rs");
+    let dirs = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_DIRS");
+    let files = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_FILES");
+    for name in &staged {
+        // Runtime extract targets live outside the support consts.
+        if matches!(name.as_str(), "hooks" | "ai-memory" | "ai-memory.exe") {
+            continue;
+        }
+        let quoted = format!("\"{name}\"");
+        assert!(
+            dirs.contains(&quoted) || files.contains(&quoted),
+            "release.yml stages top-level `{name}` but it is missing from \
+             RELEASE_SUPPORT_DIRS/FILES in upgrade.rs"
+        );
+    }
+}
+
+/// First path components under `dist/$artifact/…` and `$stage/…`, plus
+/// README.md/LICENSE when the workflow copies them onto the stage root.
+fn release_yml_staged_top_levels(release: &str) -> std::collections::BTreeSet<String> {
+    let mut tops = std::collections::BTreeSet::new();
+    for prefix in ["dist/$artifact/", "$stage/"] {
+        let mut search = release;
+        while let Some(idx) = search.find(prefix) {
+            let after = &search[idx + prefix.len()..];
+            let end = after
+                .find(|c: char| c == '"' || c == '\'' || c == '`' || c == '\\' || c.is_whitespace())
+                .unwrap_or(after.len());
+            let rel = &after[..end];
+            if let Some(top) = rel
+                .split('/')
+                .next()
+                .filter(|s| is_release_top_level_name(s))
+            {
+                tops.insert(top.to_string());
+            }
+            // Always advance so an empty relative path cannot spin forever.
+            search = &search[idx + 1..];
+        }
+    }
+    if release.contains("cp README.md LICENSE \"dist/$artifact/\"")
+        || release.contains("Copy-Item README.md, LICENSE $stage")
+    {
+        tops.insert("README.md".to_string());
+        tops.insert("LICENSE".to_string());
+    }
+    tops
+}
+
+/// Reject globs / comment noise (e.g. `"$stage/*"` in release.yml prose).
+fn is_release_top_level_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn const_str_slice_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let marker = format!("const {name}:");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("upgrade.rs must declare {name}"));
+    let from = &src[start..];
+    let end = from
+        .find(';')
+        .unwrap_or_else(|| panic!("{name} const must end with ';'"));
+    &from[..end]
 }
 
 #[test]
@@ -717,6 +818,29 @@ fn dev_loop_is_wired_consistently() {
 }
 
 #[cfg(unix)]
+#[test]
+fn hook_installer_normalizes_the_open_code_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "open-code", "--to"])
+        .arg(tmp.path().join("hooks"))
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("install-hooks --agent opencode --apply"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unsupported agent"), "{stdout}");
+}
+
+#[cfg(unix)]
 fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);
@@ -1010,6 +1134,10 @@ fn run_wrapper_with_fake_docker_env(
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // Callers test Docker/Podman UID, SELinux, and env forwarding. Keep
+        // `install-hooks` on that explicit compatibility path; native hook
+        // routing has separate regression coverage below.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -1208,12 +1336,47 @@ fn skip_pre_push_tests<T>(reason: &str) -> Option<T> {
 fn resolve_in_path(path: &std::ffi::OsStr, tool: &str) -> Option<PathBuf> {
     std::env::split_paths(path).find_map(|dir| {
         let bare = dir.join(tool);
-        if bare.is_file() {
+        if is_executable_candidate(&bare) {
             return Some(bare);
         }
         let exe = dir.join(format!("{tool}.exe"));
-        exe.is_file().then_some(exe)
+        is_executable_candidate(&exe).then_some(exe)
     })
+}
+
+#[cfg(any(unix, windows))]
+fn is_executable_candidate(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        path.is_file()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pre_push_fixture_path_skips_non_executable_shadows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let shadow_dir = temp.path().join("shadow");
+    let executable_dir = temp.path().join("executable");
+    std::fs::create_dir(&shadow_dir).unwrap();
+    std::fs::create_dir(&executable_dir).unwrap();
+    let shadow = shadow_dir.join("env");
+    std::fs::write(&shadow, "not executable").unwrap();
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let executable = executable_dir.join("env");
+    std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([shadow_dir.as_os_str(), executable_dir.as_os_str()]).unwrap();
+
+    assert_eq!(resolve_in_path(&path, "env"), Some(executable));
 }
 
 /// macOS hands back `/var/folders/...` while Git reports `/private/var/...`.
@@ -1285,7 +1448,7 @@ fn fixture_path(bin: &Path) -> Option<std::ffi::OsString> {
         let Some(real) = dirs
             .iter()
             .map(|dir| dir.join(tool))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_candidate(candidate))
         else {
             return skip_pre_push_tests(&format!("{tool} was not found on PATH"));
         };
@@ -2301,6 +2464,7 @@ mod slow {
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .env("AI_MEMORY_DOCKER", &docker)
             .env(
                 "AI_MEMORY_WRAPPER_URL",
@@ -2726,6 +2890,7 @@ mod slow {
             .env("AI_MEMORY_SKIP_SELF_UPGRADE", "1")
             .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .output()
             .unwrap();
         assert!(

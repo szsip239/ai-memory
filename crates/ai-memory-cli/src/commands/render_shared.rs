@@ -19,7 +19,7 @@
 //! lives here is only the *data* both consume.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -65,6 +65,30 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
 /// post-tool-use needs no new file). The install-hooks parity test fails
 /// if the bundle drifts.
 pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// GitHub Copilot CLI's lifecycle events, configured with PascalCase event
+/// names so the payload comes in the Claude Code/VS-Code-compatible shape
+/// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_result`) instead of
+/// its native camelCase one — this lets it free-ride on the same key-based
+/// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
+/// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
+/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// `PostToolUseFailure`, which Copilot (per
+/// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
+/// instead of `PostToolUse` when a tool call errors — the server already
+/// aliases it to `PostToolUse` (`HookEvent::parse`), so it reuses that script.
+pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -483,9 +507,7 @@ pub(crate) fn build_zero_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let hooks: Vec<serde_json::Value> = ZERO_EVENTS
         .iter()
         .map(|(zero_event, our_event)| {
@@ -571,9 +593,7 @@ pub(crate) fn build_zcode_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let mut events = serde_json::Map::new();
     for (zcode_event, our_event) in ZCODE_EVENTS {
         let mut args: Vec<String> = Vec::new();
@@ -879,6 +899,14 @@ pub(crate) enum HookShape {
     /// `hooks.json` also requires a sibling `version: 1` key at
     /// the top level — handled by the caller's apply path.
     Flat,
+    /// GitHub Copilot CLI: `"E": [ { "type":"command", "command":"..." } ]`.
+    /// Entries sit directly in the event array like Cursor's, but with no
+    /// `matcher`: Copilot rejects it on `sessionStart`/`sessionEnd`/
+    /// `userPromptSubmitted`/`agentStop`/`subagentStop`/`errorOccurred` and
+    /// treats it as an optional filter elsewhere, so omitting it everywhere
+    /// means "fire on every invocation". The file's top-level `version: 1` is
+    /// handled by the caller's apply path, as for Cursor.
+    FlatWithoutMatcher,
 }
 
 /// One hook profile = (event vocabulary, JSON shape). Each agent
@@ -965,6 +993,13 @@ pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
 pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
     events: &COMMAND_CODE_EVENTS,
     shape: HookShape::NestedWithoutMatcher,
+};
+/// Copilot keeps its flat entry shape even with PascalCase event names — only
+/// the payload sent to the script switches to snake_case — so this is
+/// `FlatWithoutMatcher`, not Claude's `Nested` (see the variant's doc).
+pub(crate) const COPILOT_CLI_PROFILE: HookProfile = HookProfile {
+    events: &COPILOT_CLI_EVENTS,
+    shape: HookShape::FlatWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -1504,6 +1539,7 @@ fn build_hook_payload_for_platform(
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
+            HookShape::FlatWithoutMatcher => Value::Array(vec![handler]),
         };
         hooks_block.insert((*event).to_string(), entry);
     }
@@ -1582,6 +1618,58 @@ pub(crate) fn local_hook_policy_v1_supported() -> bool {
     )
 }
 
+/// Fallback when no usable executable path can be embedded: the bare command
+/// name, resolved through `PATH` when each hook runs.
+#[cfg(not(windows))]
+const FALLBACK_HOOK_EXE: &str = "ai-memory";
+#[cfg(windows)]
+const FALLBACK_HOOK_EXE: &str = "ai-memory.exe";
+
+/// Strip the ` (deleted)` marker the Linux kernel appends to the
+/// `/proc/<pid>/exe` readlink once the executable's inode has been unlinked or
+/// replaced (Rust std passes the marker through verbatim —
+/// rust-lang/rust#40284). A real executable may itself use that suffix, so
+/// callers must prefer the unmodified path when it still exists.
+fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
+    match exe.to_str() {
+        Some(text) => text
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .unwrap_or(exe),
+        None => exe,
+    }
+}
+
+/// The executable path to embed in a rendered hook command, given what
+/// `current_exe()` produced.
+///
+/// The classic corrupting sequence is `ai-memory upgrade`: it replaces its own
+/// binary and then re-renders the staged hook configs from the same, now
+/// exe-deleted process, so `current_exe()` comes back as `<path> (deleted)`.
+/// Stripping the marker yields the path that now holds the freshly installed
+/// binary. A missing file or a failed resolution falls back to
+/// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
+/// hook command.
+fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    let Some(exe) = raw else {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    };
+    if exe.is_file() {
+        return exe;
+    }
+    let stripped = strip_deleted_suffix(exe);
+    if stripped.is_file() {
+        stripped
+    } else {
+        PathBuf::from(FALLBACK_HOOK_EXE)
+    }
+}
+
+/// [`embedded_exe_from`] over this process's own executable.
+pub(crate) fn hook_embedded_exe_path() -> PathBuf {
+    embedded_exe_from(std::env::current_exe().ok())
+}
+
 fn hook_command(
     script: &Path,
     server_url: &str,
@@ -1651,9 +1739,7 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1697,9 +1783,7 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1738,7 +1822,7 @@ fn windows_native_exec_spec(
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
 ) -> HookHandlerSpec {
-    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("ai-memory.exe").to_path_buf());
+    let exe = hook_embedded_exe_path();
     windows_native_exec_spec_with_exe(&exe, script, server_url, auth_token, context)
 }
 
@@ -2209,6 +2293,63 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    #[test]
+    fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/opt/ai-memory/bin/ai-memory (deleted)")),
+            PathBuf::from("/opt/ai-memory/bin/ai-memory")
+        );
+        // A marker mid-path is a legitimate directory name, not the kernel's
+        // artifact; only the trailing suffix reads as one.
+        let mid = PathBuf::from("/opt/dir (deleted)/ai-memory");
+        assert_eq!(strip_deleted_suffix(mid.clone()), mid);
+        let clean = PathBuf::from("/opt/ai-memory/bin/ai-memory");
+        assert_eq!(strip_deleted_suffix(clean.clone()), clean);
+    }
+
+    #[test]
+    fn embedded_exe_strips_the_marker_when_the_stripped_path_exists() {
+        // The exact corruption window of `ai-memory upgrade`: the process is
+        // still executing the old inode after the rename-over replace, so
+        // `current_exe()` carries the marker while the stripped path already
+        // holds the freshly installed binary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ai-memory");
+        fs::write(&exe, b"binary").expect("write exe");
+        let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
+        assert_eq!(embedded_exe_from(Some(deleted)), exe);
+    }
+
+    #[test]
+    fn embedded_exe_preserves_a_real_file_whose_name_has_the_marker_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let literal = dir.path().join("ai-memory (deleted)");
+        let stripped = dir.path().join("ai-memory");
+        fs::write(&literal, b"literal binary").expect("write literal exe");
+        fs::write(&stripped, b"decoy binary").expect("write stripped decoy");
+
+        assert_eq!(embedded_exe_from(Some(literal.clone())), literal);
+    }
+
+    #[test]
+    fn embedded_exe_falls_back_when_the_resolved_path_is_missing() {
+        // A failed resolution or a dead path must not bake a broken absolute
+        // path into hook commands; the bare name resolves through PATH when
+        // each hook runs.
+        assert_eq!(embedded_exe_from(None), PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(
+            embedded_exe_from(Some(PathBuf::from("/nonexistent/ai-memory (deleted)"))),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
+        let exe = hook_embedded_exe_path();
+        assert!(exe.is_file(), "{} should exist", exe.display());
+        assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
+    }
 
     fn decode_powershell_encoded_command(command: &str) -> String {
         let (_, encoded) = command
@@ -2750,6 +2891,38 @@ if (inheritOnly) {
     /// outer level — which made Claude Code refuse to load
     /// settings.json with "hooks: Expected array, but received
     /// undefined" on every event.
+    /// Copilot CLI keeps its flat entry shape even when the event names are
+    /// PascalCase (only the payload sent to the script changes), and rejects
+    /// `matcher` on session/stop/subagent events — so every entry must be a
+    /// bare `{type, command}` handler: no nested `hooks`, no `matcher`.
+    #[test]
+    fn copilot_cli_payload_uses_flat_entries_without_matcher() {
+        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let v = build_posix_hook_payload(
+            COPILOT_CLI_PROFILE.events,
+            &root,
+            "http://localhost:49374",
+            None,
+            COPILOT_CLI_PROFILE.shape,
+        );
+        let hooks = v.pointer("/hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+        for (event, _) in COPILOT_CLI_EVENTS {
+            let entry = v
+                .pointer(&format!("/hooks/{event}/0"))
+                .and_then(|e| e.as_object())
+                .unwrap_or_else(|| panic!("missing /hooks/{event}/0"));
+            assert_eq!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("command"),
+                "{event}"
+            );
+            assert!(entry.contains_key("command"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("hooks"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("matcher"), "{event}: {entry:?}");
+        }
+    }
+
     #[test]
     fn cursor_payload_uses_flat_shape() {
         // Flat shape: no inner `hooks: [...]` array; each event
@@ -3166,7 +3339,9 @@ if (inheritOnly) {
                 HookShape::Nested | HookShape::NestedWithoutMatcher => {
                     v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
                 }
-                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+                HookShape::Flat | HookShape::FlatWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0").unwrap().clone()
+                }
             }
         }
 
@@ -3212,6 +3387,7 @@ if (inheritOnly) {
             ("antigravity-cli", HookShape::Flat),
             ("grok", HookShape::Nested),
             ("devin", HookShape::Nested),
+            ("copilot-cli", HookShape::FlatWithoutMatcher),
         ] {
             let handler = handler_for(HookCommandPlatform::WindowsNative, agent, shape);
             assert!(

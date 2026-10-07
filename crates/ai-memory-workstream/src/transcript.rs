@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_memory_core::{
-    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NativeSessionIdentity, NewWorkstreamEvent,
+    Sanitizer, WorkstreamEventKind,
 };
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
@@ -20,7 +21,6 @@ use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
-const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
@@ -209,6 +209,150 @@ pub async fn discover_native_session(
     Ok(None)
 }
 
+/// Whether a Claude transcript was written by a Claude Code background session
+/// (one the Claude Code daemon hosts), whose records carry
+/// `"sessionKind": "bg"`. Foreground transcripts never carry the field, so this
+/// keeps the launcher from asking Claude about live sessions on every resume.
+pub fn claude_session_ran_in_background(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    let Some(path) = locate_session_file(
+        ManagedHarness::Claude,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let reader = BufReader::new(File::open(&path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"sessionKind\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
+            && value.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The id `claude attach` takes for `native_session_id` when `claude agents
+/// --json` lists it as a live background session in this checkout.
+///
+/// Claude Code refuses `--resume` on a background session that is still
+/// running and points at `claude attach <id>`, whose `<id>` is the short id
+/// the listing prints, not the full session id. Anything unexpected in the
+/// listing yields `None`, so the launcher keeps its native resume.
+pub fn claude_live_background_attach_id(
+    agents_json: &[u8],
+    native_session_id: &str,
+    cwd: &Path,
+) -> Option<String> {
+    let sessions: Vec<Value> = serde_json::from_slice(agents_json).ok()?;
+    sessions.iter().find_map(|session| {
+        let attach_id = session.get("id").and_then(Value::as_str)?;
+        let matches = session.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+            && session.get("kind").and_then(Value::as_str) == Some("background")
+            && session
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
+        (matches
+            && attach_id
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphanumeric())
+            && attach_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then(|| attach_id.to_string())
+    })
+}
+
+/// Find the Claude Code background session that `native_session_id` attached
+/// to during this run, if any.
+///
+/// `/resume` on a background session (one hosted by the Claude Code daemon)
+/// does not continue the foreground session: the conversation keeps going in
+/// the background session's own transcript, whose records carry
+/// `"sessionKind": "bg"` and name the attached foreground session in
+/// `session_id`. The daemon's hooks never see this run's id, so without this
+/// the workstream stays on the foreground session and the next launch resumes
+/// a transcript with no conversation in it.
+///
+/// Only transcripts written since `started_at` are read, the newest first,
+/// and a record must also match this checkout. Transcripts without those
+/// fields (older Claude Code builds) never match.
+pub fn claude_attached_background_session(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Option<String>> {
+    if !valid_native_session_id(native_session_id) {
+        return Ok(None);
+    }
+    let mut candidates = collect_session_files(ManagedHarness::Claude, home, session_dir)?;
+    candidates.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    let attached_marker = format!("\"session_id\":\"{native_session_id}\"");
+    for path in candidates.into_iter().take(512) {
+        if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
+            break;
+        }
+        if path
+            .file_stem()
+            .is_some_and(|stem| stem == std::ffi::OsStr::new(native_session_id))
+        {
+            continue;
+        }
+        let reader = BufReader::new(File::open(&path)?);
+        for line in reader.lines() {
+            let line = line?;
+            if !line.contains(&attached_marker) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let background = value.get("sessionKind").and_then(Value::as_str) == Some("bg");
+            let attached =
+                value.get("session_id").and_then(Value::as_str) == Some(native_session_id);
+            let in_checkout = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
+            let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            if background
+                && attached
+                && in_checkout
+                && session != native_session_id
+                && valid_native_session_id(session)
+            {
+                return Ok(Some(session.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// List newest native sessions whose recorded working directory matches the
 /// current checkout. Native stores are opened read-only and unrelated paths are
 /// excluded before candidates reach the launcher prompt.
@@ -264,6 +408,60 @@ pub async fn list_native_sessions(
         }
     }
     Ok(sessions)
+}
+
+/// Resolve the on-disk directory holding this harness's native "memory"
+/// store for the given checkout, when the harness has one and a session
+/// recorded for this cwd can be found.
+///
+/// Claude Code keeps a `memory/` directory as a sibling of its own session
+/// transcripts, at `<home>/.claude/projects/<project-dir>/memory/` — the
+/// native store `ai-memory doctor` warns about capturing unless a marker's
+/// `ignore_paths` excludes it (harness-issue #1003). `<project-dir>`'s name
+/// is Claude Code's own encoding of the cwd, which is **not** the same
+/// encoding on every platform (native Windows also folds `\` and `:`, not
+/// only `/`), so this never re-derives that name. Instead it reuses the same
+/// content-based match [`list_native_sessions`] uses — read each session
+/// file's own recorded `cwd` until one matches — and returns that file's
+/// parent directory, which is correct on any platform by construction.
+///
+/// Callers should pass the checkout's **repository root**, not an arbitrary
+/// subdirectory: Claude Code keys this store by repository root, so a
+/// worktree or a subdirectory shares the root's `memory/` directory. This
+/// function itself does no such resolution -- it matches whatever `cwd` it
+/// is given against recorded session cwds -- so passing a subdirectory here
+/// finds nothing even when a `memory/` store genuinely exists for the
+/// repository.
+///
+/// Harnesses with no known native-memory convention return `None`
+/// unconditionally; callers should treat that as "nothing to report", not as
+/// an error.
+#[must_use]
+pub fn native_memory_dir(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if harness != ManagedHarness::Claude {
+        return None;
+    }
+    let mut files = collect_session_files(harness, home, session_dir).ok()?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    for path in files {
+        let Ok(Some((_, recorded_cwd))) = session_header_for_cwd(harness, &path, cwd) else {
+            continue;
+        };
+        if same_path(&recorded_cwd, cwd) {
+            let memory_dir = path.parent()?.join("memory");
+            return memory_dir.is_dir().then_some(memory_dir);
+        }
+    }
+    None
 }
 
 /// Whether the native store holds `native_session_id` for this checkout.
@@ -3417,6 +3615,16 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
     }
 }
 
+/// The primary native store root a launch reads: `session_dir` when an
+/// override resolved one, otherwise the harness default under `home`.
+pub fn native_store_root(
+    harness: ManagedHarness,
+    home: &Path,
+    session_dir: Option<&Path>,
+) -> PathBuf {
+    session_root(harness, home, session_dir)
+}
+
 /// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
 /// to the default home during acceptance. Scan the configured root first and
 /// the default root as a compatibility fallback; every result still passes
@@ -3541,13 +3749,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 fn valid_native_session_id(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_NATIVE_SESSION_ID_BYTES
+    NativeSessionIdentity::parse(value, &Sanitizer::builtin()).is_ok()
         && !value.starts_with('-')
         && value != "."
         && value != ".."
         && !value.contains(['/', '\\'])
-        && !value.chars().any(char::is_control)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -4308,6 +4514,165 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn claude_session_ran_in_background_needs_its_own_bg_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&project).unwrap();
+        let write = |id: &str, records: &[Value]| {
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(project.join(format!("{id}.jsonl")), body).unwrap();
+        };
+        let ran = |id: &str| claude_session_ran_in_background(temp.path(), &cwd, None, id).unwrap();
+
+        write(
+            "fg",
+            &[json!({"type": "user", "sessionId": "fg", "cwd": cwd})],
+        );
+        assert!(!ran("fg"));
+        // A foreground transcript can quote another session's bg record (a
+        // pasted log, a tool result); only its own sessionId counts.
+        write(
+            "quoting",
+            &[
+                json!({"type": "user", "sessionId": "quoting", "cwd": cwd,
+                     "message": {"content": "{\"sessionKind\":\"bg\",\"sessionId\":\"other\"}"}}),
+                json!({"type": "user", "sessionId": "other", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(!ran("quoting"));
+        write(
+            "bg",
+            &[
+                json!({"type": "mode", "sessionId": "bg"}),
+                json!({"type": "user", "sessionId": "bg", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(ran("bg"));
+        assert!(!ran("missing"));
+    }
+
+    #[test]
+    fn claude_live_background_attach_id_matches_only_a_live_background_session_here() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let listing = |entries: Value| serde_json::to_vec(&entries).unwrap();
+        let entry = |id: &str, session: &str, kind: &str, cwd: &Path| json!({"id": id, "sessionId": session, "kind": kind, "status": "idle", "cwd": cwd});
+        let full = "94e41265-4001-431c-828e-1c54953e596b";
+
+        let live = listing(json!([
+            entry("aaaa1111", "another-session", "background", &cwd),
+            entry("94e41265", full, "background", &cwd),
+        ]));
+        assert_eq!(
+            claude_live_background_attach_id(&live, full, &cwd).as_deref(),
+            Some("94e41265")
+        );
+        for refused in [
+            // The same session listed as an interactive one, or from another
+            // checkout, is not attached to from here.
+            listing(json!([entry("94e41265", full, "interactive", &cwd)])),
+            listing(json!([entry("94e41265", full, "background", &other)])),
+            // An id that could smuggle an option or path into argv.
+            listing(json!([entry("--help", full, "background", &cwd)])),
+            listing(json!([entry("../x", full, "background", &cwd)])),
+            listing(json!([])),
+            b"not json".to_vec(),
+            listing(json!({"sessions": []})),
+        ] {
+            assert_eq!(claude_live_background_attach_id(&refused, full, &cwd), None);
+        }
+    }
+
+    #[test]
+    fn claude_attached_background_session_follows_only_this_checkouts_bg_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value]| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            path
+        };
+        let record = |session: &str, attached: &str, kind: Option<&str>, cwd: &Path| {
+            let mut value = json!({
+                "type": "user",
+                "sessionId": session,
+                "session_id": attached,
+                "cwd": cwd,
+            });
+            if let Some(kind) = kind {
+                value["sessionKind"] = json!(kind);
+            }
+            value
+        };
+        let find = |id: &str| {
+            claude_attached_background_session(temp.path(), &cwd, None, id, started_at).unwrap()
+        };
+
+        // The foreground transcript names itself; it is never the answer.
+        write("fg", &[record("fg", "fg", None, &cwd)]);
+        assert_eq!(find("fg"), None);
+
+        // Without `sessionKind: bg`, or from another checkout, a record that
+        // names the foreground session is not a background continuation.
+        write("plain", &[record("plain", "fg", None, &cwd)]);
+        write(
+            "elsewhere",
+            &[record("elsewhere", "fg", Some("bg"), &other)],
+        );
+        assert_eq!(find("fg"), None);
+
+        // A concurrent launch in this checkout attached its own foreground
+        // session to a background one; that conversation is not this run's.
+        write(
+            "concurrent",
+            &[record("concurrent", "other-fg", Some("bg"), &cwd)],
+        );
+        assert_eq!(find("fg"), None);
+        assert_eq!(find("other-fg").as_deref(), Some("concurrent"));
+
+        // A transcript last written before the run started is not read.
+        let stale = write("stale", &[record("stale", "fg", Some("bg"), &cwd)]);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(started_at - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(find("fg"), None);
+
+        write(
+            "bg",
+            &[
+                record("bg", "earlier-client", Some("bg"), &cwd),
+                record("bg", "fg", Some("bg"), &cwd),
+            ],
+        );
+        assert_eq!(find("fg").as_deref(), Some("bg"));
+        assert_eq!(find("unrelated"), None);
     }
 
     #[test]
@@ -5937,5 +6302,111 @@ mod tests {
         assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
         // A ten-byte varint may carry only one payload bit in its final byte.
         assert_eq!(protobuf_varint(&[0xff; 10]), None);
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_sibling_memory_directory_for_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        // Claude Code's own project-directory name is irrelevant here -- the
+        // whole point of this function is to find it by content, never by
+        // guessing the encoding (which differs between POSIX and native
+        // Windows).
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+        let memory_dir = project_dir.join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            Some(memory_dir)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_memory_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+
+        // A real session was found, but it never created a memory/ store.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_session_matches_this_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": other})),
+        )
+        .unwrap();
+        fs::create_dir_all(project_dir.join("memory")).unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_for_harnesses_with_no_known_convention() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // Codex has no established native-memory convention today, so this
+        // must return None unconditionally rather than guess at a location.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_identity_adapter_preserves_exact_and_rejects_privacy_changes() {
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+            "native\u{feff}tail",
+        ] {
+            assert!(
+                !valid_native_session_id(id),
+                "adapter must reject dirty identity"
+            );
+        }
+        for id in ["session_vendor-01", "native-界-01"] {
+            assert!(valid_native_session_id(id));
+        }
+        for id in ["../session", "-selector", "a/b", "a\\b", ".", ".."] {
+            assert!(!valid_native_session_id(id));
+        }
     }
 }
