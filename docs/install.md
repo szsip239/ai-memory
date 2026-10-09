@@ -135,7 +135,9 @@ ai-memory install-mcp --client claude-code --session-aware --apply
 
 It replaces the static HTTP MCP entry with a local ai-memory stdio bridge that
 still connects to the configured remote server and bearer token, while
-forwarding Claude's lifecycle session id. Pair it with
+forwarding Claude's lifecycle session id. On a Docker-wrapper install the
+wrapper runs the bridge through its checksum-verified native host client, so
+the configured loopback server URL resolves on the host. Pair it with
 `[auto_scope] mode = "per_session"` when the same operator runs concurrent
 Claude Code sessions in different projects. The default static HTTP
 registration remains appropriate for one active project at a time.
@@ -663,17 +665,17 @@ verbatim. Even when that fallback is retained, the server strips any raw field
 on receipt before persistence.
 
 Native `ai-memory hook --event ...` commands spool events locally. The POSIX
-shell bundle spools too, but only on failure: it POSTs first and writes the
-event to the same `<data_dir>/hook-spool/` contract when the server is
-unreachable or answers 5xx, then flushes the backlog behind the next delivery
-that succeeds. A 4xx is a permanent rejection and is not retried. (The
-PowerShell bundle still drops an undelivered event.) Session start
+shell bundle and the PowerShell (`.ps1`) bundle spool too, but only on
+failure: they POST first and write the event to the same
+`<data_dir>/hook-spool/` contract when the server is unreachable or answers
+5xx, then flush the backlog behind the next delivery that succeeds. A 4xx
+is a permanent rejection and is not retried. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
-The POSIX bundle assigns one idempotency key before its initial POST and keeps
-that key if the event enters the spool. A server that processed an event but
-lost the response will not duplicate its observation or completed session-end
+The script bundles assign one idempotency key before their initial POST and
+keep that key if the event enters the spool. A server that processed an event
+but lost the response will not duplicate its observation or completed session-end
 effects; if processing stopped after the observation commit, the retry re-runs
 downstream work. SessionEnd atomically
 commits its end watermark with its automatic handoff; a retry that finds that

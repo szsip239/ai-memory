@@ -945,6 +945,7 @@ ai_memory_post_hook() {
     fi
     case "$_amcode" in
         2*) ai_memory_kick_drain ;;
+        408|425|429) ai_memory_spool_event "$_amurl" "$_ambody" ;;
         4*) ;;
         *) ai_memory_spool_event "$_amurl" "$_ambody" ;;
     esac
@@ -1041,8 +1042,10 @@ ai_memory_json_string() {
 # TypeScript integrations gained this in #580; the script bundle is the
 # remaining capture path that POSTs and forgets.
 #
-# The backlog is drained at session boundaries only — never on the
-# per-tool-call hot path, which must not block the agent.
+# The backlog is drained at session boundaries and, after any successful
+# 2xx POST, by the detached piggyback drain in ai_memory_kick_drain —
+# never synchronously on the per-tool-call hot path, which must not block
+# the agent.
 
 ai_memory_spool_dir() {
     printf '%s/hook-spool' "$(ai_memory_state_dir)"
@@ -1164,10 +1167,10 @@ ai_memory_json_field() {
 }
 
 # Deliver the queued backlog, oldest first. Bounded by count so a drain never
-# becomes an unbounded upload. A 2xx or 4xx retires the entry (delivered, or
-# permanently rejected); anything else stops the pass and keeps the remainder
-# for the next one. The bearer goes through a 0600 header file rather than
-# curl's argv, for the reason #552 moved it off the command line.
+# becomes an unbounded upload. A 2xx or terminal 4xx retires the entry (delivered,
+# or permanently rejected); transient 408/425/429 or anything else stops the pass
+# and keeps the remainder for the next one. The bearer goes through a 0600 header file
+# rather than curl's argv, for the reason #552 moved it off the command line.
 ai_memory_drain_spool() {
     _amdmax=${1:-64}
     _amddir=$(ai_memory_spool_dir)
@@ -1196,6 +1199,7 @@ ai_memory_drain_spool() {
                 --data-binary @- 2>/dev/null) || _amdcode=000
         fi
         case "$_amdcode" in
+            408|425|429) return 0 ;;
             2*|4*) rm -f "$_amdf" 2>/dev/null || true ;;
             *) return 0 ;;
         esac

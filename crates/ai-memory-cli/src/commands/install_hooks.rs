@@ -5349,7 +5349,10 @@ fn build_pi_extension(
 fn pi_mcp_bridge_source() -> &'static str {
     r#"
 // ---- MCP bridge ------------------------------------------------------------
-const MCP_SERVER = deriveMcpServer(SERVER);
+// Pi forwards tool schemas to whichever provider it runs on, and Moonshot
+// rejects any `$ref` (#1157). The moonshot dialect inlines every reference,
+// which every provider accepts; it changes nothing but `tools/list`.
+const MCP_SERVER = `${deriveMcpServer(SERVER)}?flavor=moonshot`;
 const MCP_REQUEST_TIMEOUT_MS = 10000;
 let mcpRequestId = 0;
 
@@ -5371,8 +5374,7 @@ function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
   return anyFactory ? anyFactory([signal, timeout]) : timeout;
 }
 
-async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
-  const id = ++mcpRequestId;
+function mcpHeaders(ctx?: any): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -5383,9 +5385,14 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
     headers["X-Memory-Actor-Session-Id"] = session;
     headers["Mcp-Session-Id"] = session;
   }
+  return headers;
+}
+
+async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
+  const id = ++mcpRequestId;
   const response = await fetch(MCP_SERVER, {
     method: "POST",
-    headers,
+    headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
     signal: mcpSignal(signal),
   });
@@ -5394,6 +5401,16 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
   if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
   if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
   return payload?.result;
+}
+
+async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void> {
+  const response = await fetch(MCP_SERVER, {
+    method: "POST",
+    headers: mcpHeaders(ctx),
+    body: JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }),
+    signal: mcpSignal(signal),
+  });
+  if (!response.ok) throw new Error(`ai-memory MCP notification ${method} failed: HTTP ${response.status}`);
 }
 
 function toolInputSchema(tool: any): any {
@@ -5407,7 +5424,7 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
       capabilities: {},
       clientInfo: { name: "ai-memory-pi-extension", version: "0.0.0" },
     });
-    try { await mcpRpc("notifications/initialized"); } catch (_e) {}
+    try { await mcpNotify("notifications/initialized"); } catch (_e) {}
     const listed = await mcpRpc("tools/list");
     for (const tool of listed?.tools ?? []) {
       try {
@@ -11440,7 +11457,9 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-end\""));
         assert!(extension.contains("fetchHandoff"));
         assert!(extension.contains("customType: \"ai-memory-handoff\""));
-        assert!(extension.contains("const MCP_SERVER = deriveMcpServer(SERVER);"));
+        assert!(
+            extension.contains("const MCP_SERVER = `${deriveMcpServer(SERVER)}?flavor=moonshot`;")
+        );
         assert!(
             extension.contains("return trimmed.endsWith(\"/mcp\") ? trimmed : `${trimmed}/mcp`;")
         );
@@ -11451,7 +11470,16 @@ model = "gpt-5"
         assert!(extension.contains("function mcpSignal(signal?: AbortSignal)"));
         assert!(extension.contains("anyFactory([signal, timeout])"));
         assert!(extension.contains("mcpRpc(\"initialize\""));
-        assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("mcpNotify(\"notifications/initialized\""));
+        assert!(!extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains(
+            "async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void>"
+        ));
+        assert!(
+            extension.contains(
+                "body: JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"
+            )
+        );
         assert!(extension.contains("mcpRpc(\"tools/list\""));
         assert!(extension.contains("pi.registerTool"));
         assert!(extension.contains("label: tool.name"));
@@ -11484,6 +11512,49 @@ model = "gpt-5"
         assert!(
             !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
             "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
+    }
+
+    /// #1136: `notifications/initialized` is a JSON-RPC notification. The
+    /// generated `mcpNotify` helper must omit `id`, must not parse a 2xx
+    /// body (the server answers 202 empty), and must be the only path
+    /// `bootstrapMcpBridge` uses for that method.
+    #[test]
+    fn pi_mcp_bridge_sends_initialized_as_a_jsonrpc_notification() {
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None, "denylist");
+
+        let notify_start = extension
+            .find("async function mcpNotify(")
+            .expect("mcpNotify must be generated");
+        let notify_end = extension[notify_start..]
+            .find("function toolInputSchema")
+            .expect("toolInputSchema follows mcpNotify");
+        let notify = &extension[notify_start..notify_start + notify_end];
+        assert!(
+            notify.contains("JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"),
+            "notification JSON must omit id: {notify}"
+        );
+        assert!(
+            !notify.contains("\"id\""),
+            "mcpNotify must not mint an id member: {notify}"
+        );
+        assert!(
+            !notify.contains("response.json"),
+            "empty 202 must not be parsed as JSON: {notify}"
+        );
+        assert!(
+            notify.contains("if (!response.ok)"),
+            "non-2xx still fails the notification: {notify}"
+        );
+        assert!(
+            extension
+                .contains("try { await mcpNotify(\"notifications/initialized\"); } catch (_e) {}"),
+            "bootstrap must call mcpNotify: {extension}"
+        );
+        assert!(
+            !extension.contains("mcpRpc(\"notifications/initialized\""),
+            "bootstrap must not send initialized through mcpRpc"
         );
     }
 
