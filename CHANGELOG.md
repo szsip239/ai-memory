@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Validated registered adapters before persisting hook credentials, so a rejected
+  re-install kept the original endpoint/token pair working (downstream #826).
+- Preserved the existing operator-registered Codex lifecycle gateway as well as
+  Kimi during version-triggered auto-wire and hook re-apply (downstream #826).
 - Kept the operator-registered Kimi lifecycle gateway and assistant opt-in when
   re-applying hooks or auto-wiring a managed launch; invalid registrations fail
   instead of silently downgrading to bare hooks (downstream #826).

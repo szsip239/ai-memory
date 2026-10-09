@@ -573,6 +573,9 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         .clone()
         .or_else(|| config.auth.bearer_token.clone())
         .or_else(|| inferred.as_ref().and_then(|mcp| mcp.auth_token.clone()));
+    // A rejected adapter must not rotate credentials beneath unchanged old
+    // hooks. Validate operator state before any auth-token/auth-header write.
+    native_hook_adapter_prefix(args.agent, &config.data_dir)?;
     // #552: persist the bearer under the data dir (0600) and keep it OUT of
     // the rendered config. Before this it went onto every hook's command line —
     // as `--auth-token <token>` for native hooks, as an `AI_MEMORY_AUTH_TOKEN=`
@@ -891,6 +894,21 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Codex => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
+            let mut payload = build_profile_payload_for_agent(
+                &CODEX_PROFILE,
+                &hooks_dir,
+                &server_url,
+                auth,
+                "codex",
+                Some(&config.data_dir),
+                strategy,
+                args.capture_assistant,
+            );
+            if apply_codex_hook_adapter(&mut payload, &config.data_dir, args.capture_assistant)? {
+                println!("# Operator-registered Codex gateway hook configuration");
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             render_agent(
                 "codex",
                 &hooks_dir,
@@ -2489,7 +2507,7 @@ fn apply_to_codex_settings_in(
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
     );
-    apply_to_codex_settings_with_payload(payload, args)
+    apply_to_codex_settings_with_payload(payload, args, data_dir)
 }
 
 fn apply_to_codex_settings_with_staged(
@@ -2513,13 +2531,15 @@ fn apply_to_codex_settings_with_staged(
         // on a native path.
         args.capture_assistant,
     );
-    apply_to_codex_settings_with_payload(payload, args)
+    apply_to_codex_settings_with_payload(payload, args, data_dir)
 }
 
 fn apply_to_codex_settings_with_payload(
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
     args: &InstallHooksArgs,
+    data_dir: &Path,
 ) -> Result<()> {
+    apply_codex_hook_adapter(&mut payload, data_dir, args.capture_assistant)?;
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => codex_hooks_path()?,
@@ -2993,7 +3013,7 @@ fn merge_kimi_code_hooks(
 /// Operator-owned local adaptation, not project-marker or payload input. Keeping
 /// it beside the install state makes both re-apply and managed-run auto-wire
 /// regenerate the same gateway instead of silently returning to bare hooks.
-fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> Result<()> {
+fn native_hook_adapter_prefix(agent: AgentChoice, data_dir: &Path) -> Result<Option<String>> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Adapter {
@@ -3001,15 +3021,22 @@ fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> 
         argv: Vec<String>,
     }
 
-    let path = data_dir.join("kimi-hook-adapter.json");
+    let (stem, label) = match agent {
+        AgentChoice::KimiCode => ("kimi", "Kimi"),
+        AgentChoice::Codex => ("codex", "Codex"),
+        _ => return Ok(None),
+    };
+    let path = data_dir.join(format!("{stem}-hook-adapter.json"));
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("reading registered Kimi hook adapter"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading registered {label} hook adapter"));
+        }
     };
     anyhow::ensure!(
         metadata.file_type().is_file(),
-        "registered Kimi hook adapter must be a regular non-symlink file"
+        "registered {label} hook adapter must be a regular non-symlink file"
     );
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -3020,19 +3047,20 @@ fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> 
     }
     let file = options
         .open(&path)
-        .context("opening registered Kimi hook adapter")?;
+        .with_context(|| format!("opening registered {label} hook adapter"))?;
     anyhow::ensure!(
         file.metadata()?.file_type().is_file(),
-        "registered Kimi hook adapter is not a regular file"
+        "registered {label} hook adapter is not a regular file"
     );
     let mut bytes = Vec::new();
     file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(
         bytes.len() <= 16 * 1024,
-        "registered Kimi hook adapter exceeds 16 KiB"
+        "registered {label} hook adapter exceeds 16 KiB"
     );
-    let adapter: Adapter = serde_json::from_slice(&bytes)
-        .context("invalid registered Kimi hook adapter; refusing to replace it with bare hooks")?;
+    let adapter: Adapter = serde_json::from_slice(&bytes).with_context(|| {
+        format!("invalid registered {label} hook adapter; refusing to replace it with bare hooks")
+    })?;
     anyhow::ensure!(
         adapter.version == 1
             && !adapter.argv.is_empty()
@@ -3041,18 +3069,26 @@ fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> 
             && adapter.argv.iter().all(|arg| {
                 !arg.is_empty() && arg.len() <= 4096 && !arg.chars().any(char::is_control)
             }),
-        "invalid registered Kimi hook adapter version/argv; refusing bare-hook downgrade"
+        "invalid registered {label} hook adapter version/argv; refusing bare-hook downgrade"
     );
     anyhow::ensure!(
         cfg!(unix) && local_hook_policy_v1_supported(),
-        "registered Kimi hook adapter requires native POSIX hooks"
+        "registered {label} hook adapter requires native POSIX hooks"
     );
-    let prefix = adapter
-        .argv
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    Ok(Some(
+        adapter
+            .argv
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
+}
+
+fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> Result<()> {
+    let Some(prefix) = native_hook_adapter_prefix(AgentChoice::KimiCode, data_dir)? else {
+        return Ok(());
+    };
     for (event, command) in commands {
         if matches!(*event, "SessionStart" | "Stop" | "SessionEnd") {
             *command = format!("{prefix} -- {command}");
@@ -3062,6 +3098,47 @@ fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> 
         }
     }
     Ok(())
+}
+
+fn apply_codex_hook_adapter(
+    payload: &mut serde_json::Value,
+    data_dir: &Path,
+    capture_assistant: bool,
+) -> Result<bool> {
+    let Some(prefix) = native_hook_adapter_prefix(AgentChoice::Codex, data_dir)? else {
+        return Ok(false);
+    };
+    let hooks = payload
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("generated Codex hooks are not an object")?;
+    for event in ["SessionStart", "Stop", "SessionEnd"] {
+        if let Some(groups) = hooks
+            .get_mut(event)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for group in groups {
+                let handlers = group
+                    .get_mut("hooks")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .context("generated Codex hook handlers are not an array")?;
+                for handler in handlers {
+                    let command = handler
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .context("generated Codex native command is not a string")?;
+                    let flag = if event == "Stop" && !capture_assistant {
+                        " --capture-assistant"
+                    } else {
+                        ""
+                    };
+                    handler["command"] =
+                        serde_json::Value::String(format!("{prefix} -- {command}{flag}"));
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Insert or refresh ai-memory's `[[hooks]]` entries: drop any prior
@@ -12441,6 +12518,43 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             ApplyOutcome::NoOp
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_registered_adapter_keeps_one_opt_in_and_only_lifecycle_wrappers() {
+        let data = TempDir::new().unwrap();
+        fs::write(data.path().join("codex-hook-adapter.json"),
+            r#"{"version":1,"argv":["/opt/python3","/opt/gateway.py","--config","/private/config.json"]}"#).unwrap();
+        for capture in [false, true] {
+            let mut payload = build_profile_payload_for_agent(
+                &CODEX_PROFILE,
+                data.path(),
+                "http://localhost:1",
+                None,
+                "codex",
+                Some(data.path()),
+                None,
+                capture,
+            );
+            assert!(apply_codex_hook_adapter(&mut payload, data.path(), capture).unwrap());
+            let hooks = payload["hooks"].as_object().unwrap();
+            for (event, groups) in hooks {
+                for group in groups.as_array().unwrap() {
+                    for handler in group["hooks"].as_array().unwrap() {
+                        let command = handler["command"].as_str().unwrap();
+                        assert_eq!(
+                            command.starts_with("/opt/python3 "),
+                            matches!(event.as_str(), "SessionStart" | "Stop" | "SessionEnd")
+                        );
+                        assert_eq!(
+                            command.matches(" --capture-assistant").count(),
+                            usize::from(event == "Stop")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

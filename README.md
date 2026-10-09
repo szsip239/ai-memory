@@ -623,12 +623,13 @@ This codebase is being built collaboratively with Claude Code
 ## Local result-delivery build
 
 This checkout retains opt-in Stop receipts and the Kimi capture adapter on the
-2.6.0 release. Its deployed migration lineage is not compatible with a stock
+2.6.2 release. Its deployed migration lineage is not compatible with a stock
 binary replacement. See [local receipts and upgrade mapping](docs/stop-result-receipts.md#local-252-upgrade-lineage)
 before installing a later release or rolling back. Local V73 freezes all receipt
 metadata at commit; stock native self-upgrades are rejected, including `--force`.
 Upstream additions append as local V74–V79; see the
 [2.6.0 compatibility gate](docs/stop-result-receipts.md#local-260-compatibility).
 The local Kimi gateway must also be registered in the operator data directory;
-the binary patch alone does not enable full-reply capture. See
+the binary patch alone does not enable full-reply capture. The existing Codex
+gateway has the same opt-in persistence during version-triggered auto-wire. See
 [persistent Kimi hook wiring](docs/stop-result-receipts.md#persistent-kimi-hook-wiring).

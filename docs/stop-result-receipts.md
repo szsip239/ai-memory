@@ -180,3 +180,25 @@ then a Stop without `last_assistant_message` through a wire fixture, native spoo
 immutable receipt, mailbox and full card text. A manually injected excerpt test
 alone cannot catch missing deployed wiring. Existing user sessions must not be
 restarted for acceptance; observe their next natural lifecycle event separately.
+
+The 2.6.2 adaptation applies the same operator-only registration format to the
+already deployed Codex gateway at `<data_dir>/codex-hook-adapter.json`. Codex
+SessionStart/Stop/SessionEnd are wrapped without changing other handlers, and a
+Stop gets exactly one assistant opt-in even after a bare re-apply preserves the
+prior flag. Registered previews show the native JSON commands; unregistered
+installs retain upstream behavior. Registration preflight runs before any
+auth-token/auth-header persistence, so a rejected registration does not rotate
+credentials beneath unchanged hooks. Claude and other agents are not implicitly
+registered or enabled.
+
+## Local 2.6.2 compatibility
+
+The pinned upstream tag is v2.6.2, not unreleased main. All 78 local migration
+files remain byte-identical to the verified local 2.6.0 deployment; the schema
+ceiling remains V79 and the V66 gap is retained. No migration receipts are
+rewritten. Upstream sanitizer-before-cap, unreachable-spool retry and agent-page
+preservation fixes are merged with the local immutable Stop and Kimi adapters.
+Retain `profile.enabled=false`, `run.require_server=true`, exact operator-home
+routes and mixed-case project markers unless separately changed by the operator.
+Verify existing database rows/IDs, native receipt replay, managed auto-wire and
+the real Kimi runtime against a local model fixture before production replacement.
