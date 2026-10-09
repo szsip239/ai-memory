@@ -90,6 +90,11 @@ uuid.workspace = true
 
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Already in the locked dependency graph. O_NONBLOCK/O_NOFOLLOW keep an
+# operator registration replaced by a FIFO/symlink from hanging auto-wire.
+libc = "0.2.186"
+
 [dev-dependencies]
 ai-memory-test-support.workspace = true
 tempfile.workspace = true

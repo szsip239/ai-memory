@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Kept the operator-registered Kimi lifecycle gateway and assistant opt-in when
+  re-applying hooks or auto-wiring a managed launch; invalid registrations fail
+  instead of silently downgrading to bare hooks (downstream #826).
 - Preserved native deferred-suffix Stop receipts at the retry cap with explicit
   full-scan ACK indexes; kept cleared-marker async retries behind the authorized
   immutable-receipt checkpoint and bounded retryable admission (downstream #826).

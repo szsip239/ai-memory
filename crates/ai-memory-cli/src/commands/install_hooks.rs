@@ -15,7 +15,7 @@
 //!   and produces no backup.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -37,7 +37,7 @@ use crate::commands::render_shared::{
     build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, ts_capture_policy_v1,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, shell_quote, ts_capture_policy_v1,
     ts_string_literal, ts_timeout_signal,
 };
 use crate::commands::uninstall::hook_command_is_ours;
@@ -2977,16 +2977,91 @@ fn merge_kimi_code_hooks(
     project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
-    let commands = kimi_code_hook_commands(
+    let mut commands = kimi_code_hook_commands(
         staged,
         server_url,
         auth_token,
         Some(data_dir),
         project_strategy,
     );
+    apply_kimi_hook_adapter(&mut commands, data_dir)?;
     apply_atomic(config_path, |existing| {
         mutate_toml(existing, |doc| upsert_kimi_code_hooks(doc, &commands))
     })
+}
+
+/// Operator-owned local adaptation, not project-marker or payload input. Keeping
+/// it beside the install state makes both re-apply and managed-run auto-wire
+/// regenerate the same gateway instead of silently returning to bare hooks.
+fn apply_kimi_hook_adapter(commands: &mut [(&str, String)], data_dir: &Path) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Adapter {
+        version: u8,
+        argv: Vec<String>,
+    }
+
+    let path = data_dir.join("kimi-hook-adapter.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("reading registered Kimi hook adapter"),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "registered Kimi hook adapter must be a regular non-symlink file"
+    );
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&path)
+        .context("opening registered Kimi hook adapter")?;
+    anyhow::ensure!(
+        file.metadata()?.file_type().is_file(),
+        "registered Kimi hook adapter is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 16 * 1024,
+        "registered Kimi hook adapter exceeds 16 KiB"
+    );
+    let adapter: Adapter = serde_json::from_slice(&bytes)
+        .context("invalid registered Kimi hook adapter; refusing to replace it with bare hooks")?;
+    anyhow::ensure!(
+        adapter.version == 1
+            && !adapter.argv.is_empty()
+            && adapter.argv.len() <= 16
+            && Path::new(&adapter.argv[0]).is_absolute()
+            && adapter.argv.iter().all(|arg| {
+                !arg.is_empty() && arg.len() <= 4096 && !arg.chars().any(char::is_control)
+            }),
+        "invalid registered Kimi hook adapter version/argv; refusing bare-hook downgrade"
+    );
+    anyhow::ensure!(
+        cfg!(unix) && local_hook_policy_v1_supported(),
+        "registered Kimi hook adapter requires native POSIX hooks"
+    );
+    let prefix = adapter
+        .argv
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (event, command) in commands {
+        if matches!(*event, "SessionStart" | "Stop" | "SessionEnd") {
+            *command = format!("{prefix} -- {command}");
+            if *event == "Stop" {
+                command.push_str(" --capture-assistant");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Insert or refresh ai-memory's `[[hooks]]` entries: drop any prior
@@ -6770,13 +6845,14 @@ fn render_kimi_code(
             );
         }
     }
-    let commands = kimi_code_hook_commands(
+    let mut commands = kimi_code_hook_commands(
         hooks_dir,
         server_url,
         auth_token,
         Some(data_dir),
         project_strategy,
     );
+    apply_kimi_hook_adapter(&mut commands, data_dir)?;
     let mut doc = toml_edit::DocumentMut::new();
     upsert_kimi_code_hooks(&mut doc, &commands)?;
     println!("# Kimi Code hook config — merge into $KIMI_CODE_HOME/config.toml");
@@ -12251,6 +12327,78 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kimi_code_apply_restores_registered_gateway_after_bare_config() {
+        let data = TempDir::new().unwrap();
+        let path = data.path().join("config.toml");
+        fs::write(&path, "default_model = 'unchanged'\n").unwrap();
+        fs::write(
+            data.path().join("kimi-hook-adapter.json"),
+            r#"{"version":1,"argv":["/opt/operator/python3","/opt/operator/gateway.py","--config","/private/with spaces.json"]}"#,
+        )
+        .unwrap();
+        merge_kimi_code_hooks(
+            data.path(),
+            "http://localhost:1",
+            None,
+            data.path(),
+            None,
+            &path,
+        )
+        .unwrap();
+        let entries = kimi_code_hooks_in(&path);
+        assert_eq!(entries.len(), KIMI_CODE_EVENTS.len());
+        for (event, command) in entries {
+            let wrapped = matches!(event.as_str(), "SessionStart" | "Stop" | "SessionEnd");
+            assert_eq!(command.starts_with("/opt/operator/python3 "), wrapped);
+            assert_eq!(command.contains("--capture-assistant"), event == "Stop");
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            merge_kimi_code_hooks(
+                data.path(),
+                "http://localhost:1",
+                None,
+                data.path(),
+                None,
+                &path
+            )
+            .unwrap(),
+            ApplyOutcome::NoOp
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn kimi_code_bad_adapter_keeps_existing_hook_config() {
+        let data = TempDir::new().unwrap();
+        let path = data.path().join("config.toml");
+        fs::write(&path, "default_model = 'unchanged'\n").unwrap();
+        let before = fs::read(&path).unwrap();
+        for registration in [
+            r#"{"version":2,"argv":["/opt/operator/python3"]}"#,
+            r#"{"version":1,"argv":[]}"#,
+            r#"{"version":1,"argv":["relative"]}"#,
+            r#"{"version":1,"argv":["/absolute","line\ncommand"]}"#,
+            r#"{"version":1,"argv":["/absolute"],"unexpected":true}"#,
+        ] {
+            fs::write(data.path().join("kimi-hook-adapter.json"), registration).unwrap();
+            assert!(
+                merge_kimi_code_hooks(
+                    data.path(),
+                    "http://localhost:1",
+                    None,
+                    data.path(),
+                    None,
+                    &path
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]

@@ -629,3 +629,6 @@ before installing a later release or rolling back. Local V73 freezes all receipt
 metadata at commit; stock native self-upgrades are rejected, including `--force`.
 Upstream additions append as local V74–V79; see the
 [2.6.0 compatibility gate](docs/stop-result-receipts.md#local-260-compatibility).
+The local Kimi gateway must also be registered in the operator data directory;
+the binary patch alone does not enable full-reply capture. See
+[persistent Kimi hook wiring](docs/stop-result-receipts.md#persistent-kimi-hook-wiring).

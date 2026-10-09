@@ -143,3 +143,40 @@ most 200 ms; timeout never acknowledges an unclassified selected result. No raw
 session-id lookup or unlocked preflight substitutes for normal authorization.
 Receiver-only retries do not advance `last_persisted_ms`; real durable insertion
 already records that timestamp inside the processor.
+
+## Persistent Kimi hook wiring
+
+Kimi's native Stop payload contains no final reply. The local gateway reads its
+exact session wire log, stores the selected full reply, and injects the bounded
+assistant excerpt. Merely retaining the server patch or starting with
+`ai-memory run kimi` does not install that gateway. Upstream auto-wire previously
+regenerated bare hooks, so a one-time manual command edit was not durable.
+
+This fork reads an explicit operator-owned `<data_dir>/kimi-hook-adapter.json`
+when rendering or applying Kimi hooks, including managed-run auto-wire:
+
+```json
+{"version":1,"argv":["/absolute/python3","/absolute/subscribed_hook.py","--config","/absolute/private-config.json"]}
+```
+
+The installer shell-quotes each literal argv value, adds `--` and the freshly
+rendered native command, and wraps only SessionStart, Stop and SessionEnd. Stop
+also receives `--capture-assistant`; the server still needs its separate
+`capture_assistant=true` opt-in. Provider/model settings and unrelated hooks are
+preserved. Re-apply is idempotent, while endpoint/auth/strategy changes still
+reach the native command. With no registration, upstream defaults are unchanged.
+
+The registration is trusted local executable configuration, like a manually
+installed hook, **not** project marker or lifecycle-payload input. It is versioned,
+bounded to 16 KiB / 16 argv entries / 4096 bytes per argument, requires an absolute
+executable and a regular non-symlink registration file, and rejects unknown fields,
+empty/control-character arguments and unsupported platforms. Reads use a bounded
+single file handle; native POSIX opens are nonblocking and do not follow symlinks. Invalid or unreadable state refuses a bare-hook downgrade.
+This downstream registration supports native POSIX hooks only. Removing it and
+re-applying restores stock Kimi commands; retain private configuration backups.
+
+Acceptance must exercise real CLI install/re-apply and managed-launch auto-wire,
+then a Stop without `last_assistant_message` through a wire fixture, native spool,
+immutable receipt, mailbox and full card text. A manually injected excerpt test
+alone cannot catch missing deployed wiring. Existing user sessions must not be
+restarted for acceptance; observe their next natural lifecycle event separately.
