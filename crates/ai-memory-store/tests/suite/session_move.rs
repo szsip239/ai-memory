@@ -104,6 +104,7 @@ async fn a_replayed_recovery_session_end_stays_complete_after_its_session_moves(
             OwnerFilter::Any,
             Some(key.clone()),
             None,
+            None,
         )
         .await
         .unwrap()
@@ -138,6 +139,7 @@ async fn a_replayed_recovery_session_end_stays_complete_after_its_session_moves(
             OwnerFilter::Any,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -150,7 +152,14 @@ async fn a_replayed_recovery_session_end_stays_complete_after_its_session_moves(
 
     let replay = store
         .writer
-        .admit_hook_session_event(session, sanitized(end), OwnerFilter::Any, Some(key), None)
+        .admit_hook_session_event(
+            session,
+            sanitized(end),
+            OwnerFilter::Any,
+            Some(key),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert!(

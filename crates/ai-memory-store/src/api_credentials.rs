@@ -442,7 +442,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 0, "local V82 (upstream V79) drops the 1.x token columns");
+        assert_eq!(
+            cols, 0,
+            "local V82 (upstream V79) drops the 1.x token columns"
+        );
     }
 
     fn column_count(conn: &Connection, table: &str, column: &str) -> i64 {
