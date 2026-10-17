@@ -202,3 +202,28 @@ Retain `profile.enabled=false`, `run.require_server=true`, exact operator-home
 routes and mixed-case project markers unless separately changed by the operator.
 Verify existing database rows/IDs, native receipt replay, managed auto-wire and
 the real Kimi runtime against a local model fixture before production replacement.
+
+## Local 3.1.0 compatibility
+
+The pinned upstream tag is v3.1.0. Upstream 3.x V77–V83 (`recovery_ingest_keys`,
+`sessions_droid_agent_kind`, `drop_legacy_user_token_columns`,
+`sessions_muse_agent_kind`, `sessions_codebuddy_agent_kind`,
+`managed_run_previous_native_session`, `sessions_ibm_bob_agent_kind`) are
+appended as local V80–V86. The SQL is unchanged; only its versioned filenames
+move. Every deployed migration through local V79, including the intentional V66
+gap, keeps its original name and checksum; no migration receipts are rewritten.
+Upstream's `ingest_keys` recovery columns (local V80) coexist with the local V65
+`observation_id` backfill, which is still written on every keyed insert.
+
+Upstream 3.0 removed the 1.x `user add|expire|revive|rotate-token` commands and
+drops the legacy `users` token columns in local V82; existing tokens keep
+working as `aim_` API keys. 3.0 also turns on the `memory_query` observation
+stream by default and changes scoped `/api/v1/search` ranking — see
+`docs/upgrading-to-3.0.md` before production replacement.
+
+After local V86, the previous local V79 (2.6.2-patched) binary is not a
+binary-only rollback target. Keep the pre-upgrade database/configuration
+snapshot and reconcile any post-upgrade writes before restoring it; never
+rewrite `refinery_schema_history` to force a downgrade. Retain
+`profile.enabled=false`, `run.require_server=true`, exact operator-home routes
+and mixed-case project markers unless separately changed by the operator.
